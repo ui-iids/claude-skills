@@ -1,2 +1,2 @@
 # claude-skills
-RCDS useful clause skills
+RCDS useful Claude skills
