@@ -220,6 +220,11 @@ exact structure and naming. Verify these invariants:
 - Overlay relative paths to the shared `deploy-repo-secrets-*` dir have the right
   depth (`../../../../../../../` from `deploy/overlays/<env>`).
 - Hosts: dev = `<app>.k8s-dev.hpc.uidaho.edu`; PR = `<app>-pr-{{.number}}...`.
+- **PR previews, only if included** — the generator's target-branch filter is set
+  to the `<pr-base>` the owner named in Step 1c, not left at the template's
+  default and not silently absent. An unfiltered generator is valid YAML that
+  syncs cleanly and then deploys a preview for every open PR in the repo, so
+  nothing downstream will catch this for you.
 
 ## Step 5 — Seal the dev env secrets
 
