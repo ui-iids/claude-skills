@@ -118,6 +118,37 @@ happens in two web UIs and would block the deploy for no reason. Instead:
      `ui-iids_my-app_c4489195-...`) into `sonar.projectKey` — or hand it to you
      and you'll set it.
 
+## Step 1c — Ask about PR preview builds
+
+PR preview builds — a throwaway deploy per open pull request — are **opt-in**,
+like SonarQube. Ask the project owner both questions together, early, because
+the answers decide which files you generate:
+
+1. *"Do you want PR preview builds — a temporary deploy spun up per open pull
+   request?"*
+2. Only if yes: *"Which branch should a PR target to get a preview?"* Offer
+   `main` as the default, but have them confirm it — previews against a
+   long-lived integration branch are expensive and surprising, and this question
+   is the only chance to catch that before it's baked in.
+
+**If they decline**, omit `deploy/overlays/dev/pull-request-builds.yaml` entirely
+and remove its entry from `deploy/overlays/dev/kustomization.yaml`. Nothing else
+in the tree changes. Mention in the Step 6 handoff that previews were skipped and
+can be added later without disturbing the rest of the manifests.
+
+**If they accept**, record the answer as `<pr-base>` and carry it into the Step 2
+substitution table. Generate `pull-request-builds.yaml` from the template with:
+
+- the pull-request generator pointed at `<org>/<app>`,
+- **the generator's branch filter scoped to `<pr-base>`** — an unfiltered
+  generator spins up a preview for every open PR against every branch, which is
+  exactly what this question exists to prevent,
+- the PR host pattern `<app>-pr-{{.number}}.k8s-dev.hpc.uidaho.edu`.
+
+Read the filter field name off the template rather than recalling it — the
+pull-request generator's source-branch and target-branch filters are named
+similarly and are easy to swap. `<pr-base>` is the branch the PR **targets**.
+
 ## Step 2 — Gather the substitution values
 
 Collect this table for the project (see the template README's substitution
@@ -135,7 +166,8 @@ reference):
 | live host + TLS | only if promoting to prod (real domain) |
 | backing services | none / mongodb / redis / postgres / mariadb |
 | persistent storage | does the app need its own PVC? |
-| PR previews? | include the ApplicationSet or not |
+| PR previews? | **ask** (Step 1c) — include the ApplicationSet or not |
+| `<pr-base>` | PR previews only — the branch a PR must target to get one (Step 1c; default `main`, confirmed not assumed) |
 
 ## Step 3 — Decide what to include
 
@@ -147,7 +179,10 @@ include":
 - **App-owned files** → keep `storage-volume.yaml` + the volume mount.
 - **Needs a DB/cache** → keep/rename `services/<svc>.yaml` and set the matching
   `*_ENABLED` env to `"True"`.
-- **No PR previews** → omit `overlays/dev/pull-request-builds.yaml`.
+- **PR previews** (Step 1c) → **no** = omit `overlays/dev/pull-request-builds.yaml`
+  *and* its entry in `overlays/dev/kustomization.yaml`; **yes** = keep it, with the
+  generator filtered to `<pr-base>`. Never decide this by inference — it's an
+  explicit question with a cost attached.
 - **Dev only** → omit the whole `deploy/overlays/live/` tree (add later on
   promotion); for prod, include it with the real host, TLS, and a pinned image
   tag.
