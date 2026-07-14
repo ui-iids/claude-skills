@@ -56,10 +56,14 @@ CI from `ui-iids/deploy-template` first.
 - ArgoCD control-plane objects (`AppProject`, `Application`, `ImageUpdater`,
   `ApplicationSet`) live in the `argocd` namespace; workloads live in
   `apps-rcds-<app>`.
-- **Never** apply to a cluster, never hand-run `kubectl`. Produce files, then let
-  the user commit/PR them for ArgoCD.
-- **Never** put plaintext secrets in manifests. Env secrets are Bitnami
-  `SealedSecret`s (ship them empty; the user seals real values with `kubeseal`).
+- **Never** apply to a cluster. The only `kubectl` you may run is the
+  `--dry-run=client` secret generation in Step 5, which touches no cluster.
+  Produce files, then let the user commit/PR them for ArgoCD.
+- **Never** put plaintext secrets in manifests, chat, or commit messages. Env
+  secrets are Bitnami `SealedSecret`s: you seal the **dev** values yourself
+  (Step 5) by piping `.env.secrets` through `kubeseal` without ever reading it.
+  Sealed output is encrypted and safe to commit. **Live** secrets stay empty
+  until promotion.
 
 ## Step 1 — Determine the mode
 
@@ -147,6 +151,10 @@ include":
 - **Dev only** → omit the whole `deploy/overlays/live/` tree (add later on
   promotion); for prod, include it with the real host, TLS, and a pinned image
   tag.
+- **Secrets are never trimmed.** Every app keeps
+  `deploy/overlays/dev/secrets/{env.yaml,kustomization.yaml}` and the `envFrom`
+  block in `deployment.yaml`, even with no secrets today — an app with an empty
+  `encryptedData: {}` is valid, and adding the wiring back later is fiddly.
 
 ## Step 4 — Generate the manifest tree
 
@@ -168,6 +176,12 @@ exact structure and naming. Verify these invariants:
   Service/Deployment `app:` label and the Ingress backend `service.name` equal
   `<app>`; for multi-service, name them per service (e.g. `<app>-backend`).
 - The standalone PVC `claimName` in the Deployment matches `storage-volume.yaml`.
+- **Secret wiring** — the SealedSecret's `metadata.name` (`env`) matches the
+  Deployment's `envFrom.secretRef.name`. A mismatch here fails the same way a bad
+  image string does: pods never start, because the referenced Secret doesn't
+  exist. The dev overlay's `kustomization.yaml` must still list `secrets`, and
+  `secrets/kustomization.yaml` must still list `env.yaml` — both come free with
+  the template copy, so **verify these rather than rewrite them**.
 - Overlay relative paths to the shared `deploy-repo-secrets-*` dir have the right
   depth (`../../../../../../../` from `deploy/overlays/<env>`).
 - Hosts: dev = `<app>.k8s-dev.hpc.uidaho.edu`; PR = `<app>-pr-{{.number}}...`.
