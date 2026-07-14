@@ -1,6 +1,6 @@
 ---
 name: deploy-my-application
-description: Deploy a University of Idaho RCDS/IIDS application to our Kubernetes cluster by generating ArgoCD + Kustomize deploy manifests in the `ui-iids/kubernetes-apps` GitOps repo, modeled on the canonical `apps/rcds/apps/deploy-template/` example. Handles two cases — (1) deploy an EXISTING repo from the `ui-iids` or `ui-insight` GitHub orgs, or (2) scaffold and deploy a NEW project (pick a namespace, generate the full manifest tree). Use when the user says "deploy my application", "deploy this repo", "deploy my app to the cluster", "set up deploy manifests", "create a namespace and deploy", "add my project to kubernetes-apps", or invokes /deploy-my-application.
+description: Deploy a University of Idaho RCDS/IIDS application to our Kubernetes cluster by generating ArgoCD + Kustomize deploy manifests in the `ui-iids/kubernetes-apps` GitOps repo, modeled on the canonical `apps/rcds/apps/deploy-template/` example. Handles two cases — (1) deploy an EXISTING repo from the `ui-iids` or `ui-insight` GitHub orgs, or (2) scaffold and deploy a NEW project (pick a namespace, generate the full manifest tree). Also seals the app's dev env secrets into a Bitnami SealedSecret with `kubeseal`, piping `.env.secrets` through without ever reading it, and gitignores the plaintext in the app repo. Use when the user says "deploy my application", "deploy this repo", "deploy my app to the cluster", "set up deploy manifests", "create a namespace and deploy", "add my project to kubernetes-apps", "seal my secrets", "kubeseal my env file", or invokes /deploy-my-application.
 ---
 
 # Deploy my application
@@ -186,15 +186,90 @@ exact structure and naming. Verify these invariants:
   depth (`../../../../../../../` from `deploy/overlays/<env>`).
 - Hosts: dev = `<app>.k8s-dev.hpc.uidaho.edu`; PR = `<app>-pr-{{.number}}...`.
 
-## Step 5 — Hand off
+## Step 5 — Seal the dev env secrets
+
+The app's env vars reach the pod via `envFrom: secretRef: name: env` in
+`deploy/base/deployment.yaml`, supplied by the SealedSecret at
+`deploy/overlays/dev/secrets/env.yaml`. The template ships that file empty
+(`encryptedData: {}`); you replace it wholesale with the sealed output. The
+kustomization wiring is inherited from the template copy — **there is nothing to
+rewire**, only to verify (Step 4).
+
+**Prerequisite:** the app repo has a `.env.secrets` holding the dev values, one
+`KEY=value` per line, no `export`, no surrounding quotes. If it's missing, ask
+the owner for it — never invent values, and never reconstruct it from a
+`.env.example`.
+
+**Never read, `cat`, `head`, `grep`, echo, or log `.env.secrets`, and never paste
+any value from it into chat, a file, or a commit message.** You do not need to
+see it to seal it. The command below is the only correct way to handle it:
+plaintext is streamed straight into `kubeseal` and never touches disk.
+
+Run from the app repo root (where `.env.secrets` lives):
+
+```bash
+kubectl create secret generic env --dry-run=client -o yaml \
+    --from-env-file=.env.secrets \
+  | kubeseal \
+      --cert https://sealed-secrets.k8s-dev.hpc.uidaho.edu/v1/cert.pem \
+      -o yaml --scope=cluster-wide \
+  > <kubernetes-apps>/apps/rcds/apps/<app>/deploy/overlays/dev/secrets/env.yaml
+```
+
+`--dry-run=client` means no cluster contact; `--cert` fetches the public sealing
+cert over HTTPS. Neither needs cluster credentials.
+
+**Verify before trusting the output.** A failed cert fetch or a broken pipe can
+leave a file that is empty, truncated, or the wrong kind — and the shell
+redirect creates the file either way, so its existence proves nothing. Check:
+
+- `kind:` is `SealedSecret`. **If it says `Secret`, plaintext just escaped into
+  the manifest repo — delete the file immediately, tell the user, and stop.**
+- `spec.encryptedData` is non-empty, with one key per line of `.env.secrets`
+  (compare the key *count*; you may name keys, never values).
+- `metadata.name` is `env`, matching `secretRef.name` in `deployment.yaml`.
+- The `sealedsecrets.bitnami.com/cluster-wide: "true"` annotation is present on
+  both `metadata` and `spec.template.metadata`.
+
+If `kubeseal` isn't installed or the cert host is unreachable (it's behind the
+campus network), don't improvise a fallback — leave `env.yaml` empty and hand the
+sealing step back to the owner with the command above.
+
+Live is **not** sealed here: `deploy/overlays/live/secrets/env.yaml` stays empty
+and is sealed at promotion against the live cert.
+
+### Step 5b — Gitignore the plaintext (app repo only)
+
+In the **app repo** — not kubernetes-apps — ensure `.gitignore` contains:
+
+```
+.env.secrets
+secrets.yaml
+```
+
+`.env.secrets` is the real plaintext. `secrets.yaml` is the intermediate the
+older two-step seal wrote to disk; the piped command never creates it, but ignore
+it anyway so a hand-run of the old flow can't commit plaintext. Note the app
+template's `.gitignore` ships as unrelated boilerplate and ignores neither, so
+assume you must add them.
+
+Do **not** add these to kubernetes-apps' `.gitignore`. The sealed `env.yaml`
+there is encrypted and **must** be committed — ArgoCD can't apply what isn't in
+the repo.
+
+## Step 6 — Hand off
 
 - Summarize the files created and the key substitutions.
-- Tell the user the two remaining manual steps you cannot/should not do:
-  1. **Seal secrets** — populate `secrets/env.yaml` via `kubeseal` (it ships empty).
-  2. **Commit + open a PR** to `ui-iids/kubernetes-apps`; ArgoCD deploys on merge.
+- Report the seal result: that dev `env.yaml` is sealed and verified, and how
+  many keys it carries — **never which values**.
+- Tell the user the remaining manual step you should not do:
+  1. **Commit + open a PR** to `ui-iids/kubernetes-apps`; ArgoCD deploys on
+     merge. The sealed `env.yaml` is encrypted and belongs in that commit.
+- Flag for later: `deploy/overlays/live/secrets/env.yaml` is still empty and
+  needs its own seal against the live cert when the app is promoted.
 - Do not commit or push unless the user explicitly asks. Note that the app repo
-  CI (workflows + Dockerfiles) and the kubernetes-apps manifests are **separate
-  repos** — each needs its own commit/PR.
+  CI (workflows + Dockerfiles, plus the `.gitignore` from Step 5b) and the
+  kubernetes-apps manifests are **separate repos** — each needs its own commit/PR.
 - If the app repo's `build-*-container.yaml` hasn't run yet (no image in GHCR),
   call that out as a blocker — ArgoCD will fail to pull until CI builds it.
 
@@ -202,9 +277,13 @@ exact structure and naming. Verify these invariants:
 
 - Two write locations only: (1) in kubernetes-apps, `apps/rcds/apps/<app>/` (plus,
   for a new live project, a `deploy-repo-secrets-<project>-live/` dir at the repo
-  root if needed); (2) in the app repo, its `.github/workflows/` and
-  `Dockerfile[.<service>]` when scaffolding/fixing CI. Don't edit other apps or
-  either template.
+  root if needed); (2) in the app repo, its `.github/workflows/`,
+  `Dockerfile[.<service>]`, and `.gitignore` when scaffolding/fixing CI or
+  Step 5b. Don't edit other apps or either template.
+- Plaintext secrets are write-only to you: stream `.env.secrets` into `kubeseal`,
+  never read it back, never echo a value, never let a `kind: Secret` file reach
+  the manifest repo. If you're ever unsure whether a file is sealed, check
+  `kind:` before it moves — not after.
 - If the user asks to deploy something outside `ui-iids`/`ui-insight`, stop and
   confirm — that's outside our deploy pattern.
 - When unsure about port, storage, domain, or backing services, ask rather than
