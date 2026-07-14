@@ -56,9 +56,11 @@ CI from `ui-iids/deploy-template` first.
 - ArgoCD control-plane objects (`AppProject`, `Application`, `ImageUpdater`,
   `ApplicationSet`) live in the `argocd` namespace; workloads live in
   `apps-rcds-<app>`.
-- **Never** apply to a cluster. The only `kubectl` you may run is the
-  `--dry-run=client` secret generation in Step 5, which touches no cluster.
-  Produce files, then let the user commit/PR them for ArgoCD.
+- **Never** write to a cluster — no `apply`, `delete`, `patch`, or `exec`.
+  Produce files, then let the user commit/PR them for ArgoCD. Step 5's
+  `--dry-run=client` seal touches no cluster at all. For the narrow read-only
+  cases that are genuinely worth a cluster round-trip, see the cluster-access
+  guardrail — and **announce before the first one**.
 - **Never** put plaintext secrets in manifests, chat, or commit messages. Env
   secrets are Bitnami `SealedSecret`s: you seal the **dev** values yourself
   (Step 5) by piping `.env.secrets` through `kubeseal` without ever reading it.
@@ -121,33 +123,92 @@ happens in two web UIs and would block the deploy for no reason. Instead:
 ## Step 1c — Ask about PR preview builds
 
 PR preview builds — a throwaway deploy per open pull request — are **opt-in**,
-like SonarQube. Ask the project owner both questions together, early, because
-the answers decide which files you generate:
+like SonarQube.
+
+**First, know where the file goes.** An app has *two* overlay trees and they are
+easy to confuse:
+
+| Tree | Contains | PR builds? |
+|------|----------|------------|
+| `apps/rcds/apps/<app>/overlays/dev/` | **control plane** — `Application`, `AppProject`, `ImageUpdater`, `ApplicationSet` (all in ns `argocd`) | ✅ **here** |
+| `apps/rcds/apps/<app>/deploy/overlays/dev/` | **workloads** — Deployments, Ingress, secrets, image pins | ❌ never |
+
+`pull-request-builds.yaml` is an `ApplicationSet` — a control-plane object — so it
+lives at `<app>/overlays/dev/pull-request-builds.yaml` and is listed in
+`<app>/overlays/dev/kustomization.yaml`. Putting it under `deploy/overlays/dev/`
+gets it applied into the app's own namespace, where nothing reads it: it syncs
+green and silently does nothing.
+
+**How previews are gated (the house pattern).** The `pullRequest` generator in
+the template is gated on a **label**, not a branch:
+
+```yaml
+github:
+  owner: ui-iids
+  repo: <app>
+  appSecretName: creds-github-<org>   # creds-github-ui-iids | creds-github-ui-insight
+  labels:
+    - preview                          # PR must carry this label
+```
+
+Only PRs labeled `preview` get an environment. That is the whole gate in every
+app in the repo today — **the template ships no branch filter at all.** So don't
+go reading the filter field off the template (it isn't there); if you want branch
+scoping you are *adding* a block, not editing one.
+
+**Ask the owner:**
 
 1. *"Do you want PR preview builds — a temporary deploy spun up per open pull
-   request?"*
-2. Only if yes: *"Which branch should a PR target to get a preview?"* Offer
-   `main` as the default, but have them confirm it — previews against a
-   long-lived integration branch are expensive and surprising, and this question
-   is the only chance to catch that before it's baked in.
+   request labeled `preview`?"*
+2. Only if yes: *"Which PRs should get one?"* **Do not offer `main` as a
+   presumed default.** Check the app repo's actual branching model first
+   (`gh repo view <org>/<app> --json defaultBranchRef -q .defaultBranchRef.name`,
+   and skim recent PR targets) — plenty of our repos merge features into a
+   long-lived `test` branch and use `test → main` only as a promotion PR. On such
+   a repo, "previews for PRs into `main`" yields previews for exactly the
+   promotion PR, which may or may not be what they meant. Restate their answer as
+   an explicit arrow (`feature/* → test`, or `test → main`) and get confirmation
+   before generating — "PRs into X" and "PRs from X" are opposite ends of the
+   arrow and users mix them up.
 
-**If they decline**, omit `deploy/overlays/dev/pull-request-builds.yaml` entirely
-and remove its entry from `deploy/overlays/dev/kustomization.yaml`. Nothing else
-in the tree changes. Mention in the Step 6 handoff that previews were skipped and
-can be added later without disturbing the rest of the manifests.
+**If they decline**, omit `overlays/dev/pull-request-builds.yaml` and its entry in
+`overlays/dev/kustomization.yaml`. Nothing else changes. Mention in the Step 6
+handoff that previews were skipped and can be added later.
 
-**If they accept**, record the answer as `<pr-base>` and carry it into the Step 2
-substitution table. Generate `pull-request-builds.yaml` from the template with:
+**If they accept**, generate `pull-request-builds.yaml` from the template with the
+generator pointed at `<org>/<app>`, the `preview` label gate kept, and the PR host
+pattern `<app>-pr-{{.number}}.k8s-dev.hpc.uidaho.edu`.
 
-- the pull-request generator pointed at `<org>/<app>`,
-- **the generator's branch filter scoped to `<pr-base>`** — an unfiltered
-  generator spins up a preview for every open PR against every branch, which is
-  exactly what this question exists to prevent,
-- the PR host pattern `<app>-pr-{{.number}}.k8s-dev.hpc.uidaho.edu`.
+**Branch scoping (only if they asked for it).** Add a `filters:` list as a sibling
+of `github:` under `pullRequest:`. The two field names are easy to swap and mean
+opposite things:
 
-Read the filter field name off the template rather than recalling it — the
-pull-request generator's source-branch and target-branch filters are named
-similarly and are easy to swap. `<pr-base>` is the branch the PR **targets**.
+- `branchMatch` — the **source** (head) branch, where the code comes *from*
+- `targetBranchMatch` — the **destination** (base) branch, where it merges *into*
+
+```yaml
+filters:
+  # "PRs into test"           -> feature/* -> test
+  - targetBranchMatch: "^test$"
+  # "PRs from test into main" -> the promotion PR only
+  - branchMatch: "^test$"
+    targetBranchMatch: "^main$"
+```
+
+Entries in the list are **OR**'d; conditions *within* one entry are **AND**'d. The
+label gate applies on top (label AND filter). Anchor the regexes (`^…$`) —
+`main` unanchored also matches `maintenance-fix`.
+
+`filters` needs ArgoCD ≥ 2.12; we run 3.3.x, so it's available. If you need to
+confirm the running version, see the cluster-access note in **Guardrails**.
+
+**Cross-repo contract — check this or previews never start.** The app repo's build
+workflows must actually fire for the PRs you just scoped. In each
+`build-*-container.yaml`, `on.pull_request.branches` filters by the PR's **target**
+branch. If previews are scoped to `test → main` but CI only builds
+`pull_request: branches: [test]`, no image is ever pushed for that PR and every
+preview pod sits in `ImagePullBackOff`. The workflow's branch list must include
+the target branch of every PR you want previewed.
 
 ## Step 2 — Gather the substitution values
 
@@ -167,7 +228,7 @@ reference):
 | backing services | none / mongodb / redis / postgres / mariadb |
 | persistent storage | does the app need its own PVC? |
 | PR previews? | **ask** (Step 1c) — include the ApplicationSet or not |
-| `<pr-base>` | PR previews only — the branch a PR must target to get one (Step 1c; default `main`, confirmed not assumed) |
+| PR scope | PR previews only — the confirmed source→target arrow (Step 1c). Label-gated by default; add `filters:` only if they asked for branch scoping. Never assume `main`. |
 
 ## Step 3 — Decide what to include
 
@@ -180,9 +241,12 @@ include":
 - **Needs a DB/cache** → keep/rename `services/<svc>.yaml` and set the matching
   `*_ENABLED` env to `"True"`.
 - **PR previews** (Step 1c) → **no** = omit `overlays/dev/pull-request-builds.yaml`
-  *and* its entry in `overlays/dev/kustomization.yaml`; **yes** = keep it, with the
-  generator filtered to `<pr-base>`. Never decide this by inference — it's an
-  explicit question with a cost attached.
+  *and* its entry in `overlays/dev/kustomization.yaml`; **yes** = keep it (control-plane
+  overlay, not `deploy/overlays/dev/`), label-gated, plus `filters:` if they asked
+  for branch scoping. Never decide this by inference — it's an explicit question
+  with a cost attached: **each preview is a full stack** — every service, every
+  backing service (Postgres/Redis/…), and every PVC in the tree, duplicated per
+  open PR and live until it closes. Say that cost out loud when they choose.
 - **Dev only** → omit the whole `deploy/overlays/live/` tree (add later on
   promotion); for prod, include it with the real host, TLS, and a pinned image
   tag.
@@ -220,11 +284,93 @@ exact structure and naming. Verify these invariants:
 - Overlay relative paths to the shared `deploy-repo-secrets-*` dir have the right
   depth (`../../../../../../../` from `deploy/overlays/<env>`).
 - Hosts: dev = `<app>.k8s-dev.hpc.uidaho.edu`; PR = `<app>-pr-{{.number}}...`.
-- **PR previews, only if included** — the generator's target-branch filter is set
-  to the `<pr-base>` the owner named in Step 1c, not left at the template's
-  default and not silently absent. An unfiltered generator is valid YAML that
-  syncs cleanly and then deploys a preview for every open PR in the repo, so
-  nothing downstream will catch this for you.
+- **PR previews, only if included** → every invariant in Step 4b.
+
+## Step 4b — PR preview invariants (only if previews are included)
+
+Previews fail in ways the normal deploy never does, and **every failure below is
+silent** — valid YAML, green sync, wrong result. Walk this list explicitly.
+
+- **AppProject namespace wildcard — the hard blocker.** Previews deploy to
+  `apps-rcds-<app>-pr-<N>`, but `base/project.yaml` restricts destinations to the
+  single namespace `apps-rcds-<app>`. It **must** carry a trailing `*`:
+
+  ```yaml
+  destinations:
+    - name: "in-cluster"
+      namespace: "apps-rcds-<app>*"   # * admits the -pr-<N> namespaces
+  ```
+
+  Without it ArgoCD rejects every preview Application as an off-project
+  destination. Every PR-enabled app in the repo has the `*`; apps generated
+  without previews often don't — so **if you are adding previews to an existing
+  app, this is the first thing to check.**
+
+- **Every service's image must build for every previewed PR.** The ApplicationSet
+  pins *all* images to `pr-<N>-<sha>` at once. If any one
+  `build-*-container.yaml` carries a `paths:` filter on its `pull_request`
+  trigger, a PR touching none of those paths pushes no image for that service —
+  and that Deployment alone lands in `ImagePullBackOff` while everything else
+  comes up healthy. Either drop the `paths:` filter from `pull_request` on every
+  service, or don't preview. (A `paths:` filter on `push` is fine and worth
+  keeping.)
+
+- **Short-SHA length is a cross-repo contract.** ArgoCD's `{{.head_short_sha}}` is
+  **8** characters. `docker/metadata-action` defaults to **7** — a 7-vs-8
+  mismatch means the tag ArgoCD asks for never exists. Each workflow must set:
+
+  ```yaml
+  env:
+    DOCKER_METADATA_SHORT_SHA_LENGTH: 8   # match ArgoCD's head_short_sha
+    DOCKER_METADATA_PR_HEAD_SHA: true     # PR head SHA, not the merge-commit SHA
+  ```
+
+  and emit `type=ref,event=pr,suffix=-{{sha}}`. `DOCKER_METADATA_PR_HEAD_SHA`
+  matters just as much: without it the tag carries GitHub's synthetic merge commit
+  SHA, which `head_short_sha` never equals. (ArgoCD also exposes
+  `{{.head_short_sha_7}}` if a workflow is pinned to 7.)
+
+- **Digest pins do not defeat the tag override — don't "fix" this.** Once
+  argocd-image-updater has run, `deploy/overlays/dev/kustomization.yaml` holds both
+  `newTag: main` *and* `digest: sha256:…`, which kustomize renders as
+  `image:tag@digest` — and runtimes resolve by digest, ignoring the tag. It looks
+  like previews must run `main`. They don't: ArgoCD applies its `kustomize.images`
+  override by shelling out to `kustomize edit set image`, which **replaces the
+  whole entry and drops the digest**, leaving a clean `:pr-<N>-<sha>`. Verified on
+  kustomize v5.8.1. Leave the overlay alone.
+
+- **Patch every host-specific ConfigMap value.** Anything in `deploy/base/config.yaml`
+  holding the dev hostname — webhook/callback URLs, `CORS_ORIGINS`, OAuth redirect
+  URIs, self-referential API base URLs — still points at the **shared dev
+  deployment** inside a preview. A preview then invites an external service to post
+  callbacks into shared dev: cross-environment traffic that looks like a preview
+  bug and isn't. Grep the ConfigMap for the dev host and add a JSON-6902 patch per
+  hit, alongside the Ingress host patch:
+
+  ```yaml
+  - target: { version: v1, kind: ConfigMap, name: <app>-config }
+    patch: |-
+      - op: replace
+        path: /data/WEBHOOK_URL
+        value: https://<app>-pr-{{.number}}.k8s-dev.hpc.uidaho.edu/api/v1/...
+  ```
+
+  (Only works because the ConfigMap is a plain resource with a stable name — a
+  `configMapGenerator` would hash-suffix it and the patch target wouldn't match.)
+
+- **The env SealedSecret must be `cluster-wide`.** A namespace-scoped SealedSecret
+  will not decrypt in `apps-rcds-<app>-pr-<N>`, so every pod hangs waiting on a
+  Secret that never materializes. Step 5's `--scope=cluster-wide` already gives you
+  this — the point is **don't tighten it** to namespace scope on a preview-enabled
+  app.
+
+- **`appSecretName` matches the org:** `creds-github-ui-iids` or
+  `creds-github-ui-insight`. Wrong org = the generator silently produces zero
+  Applications (no error, just nothing).
+
+- **Names stay under limits.** Namespace `apps-rcds-<app>-pr-<N>` and DNS label
+  `<app>-pr-<N>` each cap at 63 chars. A long `<app>` can blow the label at
+  two-digit PR numbers.
 
 ## Step 5 — Seal the dev env secrets
 
@@ -307,6 +453,20 @@ the repo.
      merge. The sealed `env.yaml` is encrypted and belongs in that commit.
 - Flag for later: `deploy/overlays/live/secrets/env.yaml` is still empty and
   needs its own seal against the live cert when the app is promoted.
+- **If previews were included**, spell out how one is actually triggered — the
+  manifests alone produce nothing:
+  1. Merging to `kubernetes-apps` **activates** the ApplicationSet. No manual
+     apply: the `apps-rcds` ApplicationSet runs a git directory generator over
+     `apps/rcds/apps/*` sourcing each app's `overlays/dev`, so a new
+     `pull-request-builds.yaml` there is picked up on its own.
+  2. The PR must be **labeled `preview`** — `gh pr edit <N> --add-label preview`.
+     The label frequently doesn't exist in a fresh repo yet, and a missing label
+     is indistinguishable from "previews are broken": the generator just matches
+     nothing, with no error anywhere. Tell them to create it if needed
+     (`gh label create preview`).
+  3. State the scope you configured as an arrow (`test → main`), the URL they'll
+     get (`https://<app>-pr-<N>.k8s-dev.hpc.uidaho.edu`), and that it's pruned on
+     PR close.
 - Do not commit or push unless the user explicitly asks. Note that the app repo
   CI (workflows + Dockerfiles, plus the `.gitignore` from Step 5b) and the
   kubernetes-apps manifests are **separate repos** — each needs its own commit/PR.
@@ -328,3 +488,33 @@ the repo.
   confirm — that's outside our deploy pattern.
 - When unsure about port, storage, domain, or backing services, ask rather than
   guess; these are baked into many files and tedious to fix after the fact.
+- **The repo is the source of truth; the cluster is a last resort.** Nearly every
+  convention question is answerable by grepping sibling apps, and that's the
+  cheapest and most reliable check available:
+
+  ```bash
+  # what do apps that already have previews do?
+  grep -rl "kind: ApplicationSet" apps/rcds/apps/
+  # settle a convention by counting real usage rather than trusting the template
+  cat apps/rcds/apps/<some-pr-enabled-app>/base/project.yaml
+  ```
+
+  The template is a *teaching* artifact and lags the fleet — where template and
+  sibling apps disagree, the siblings win. Read at least one working PR-enabled
+  app before writing a `pull-request-builds.yaml`.
+
+- **Cluster access: read-only, announced, never for Secret contents.** Occasionally
+  a fact only the cluster has is worth it — the running ArgoCD version (does it
+  support `filters`?), whether `creds-github-<org>` exists, or a schema check via
+  `kubectl apply --dry-run=server` (validates against the real API server and
+  persists nothing). These are legitimate, but:
+  - **Say you're about to touch the cluster before you do it.** The user is
+    thinking about files in a repo; unannounced `kubectl` against their live
+    context is a surprise, and `--dry-run=server` still contacts the cluster.
+  - Prefer existence checks that cannot leak: `kubectl get secret <name>
+    --ignore-not-found`. **Never** read a Secret's `data`/`stringData` — and don't
+    reach for `-o jsonpath` on a Secret even for a benign field; on Secrets the
+    habit is the risk.
+  - Never `exec` into `argocd-repo-server` (or any pod) to try things out. If you
+    need a tool it has — e.g. the exact `kustomize` build it uses — fetch that
+    version into a scratch dir locally and test there.
