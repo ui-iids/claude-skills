@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Address Copilot (or other reviewer) comments on a GitHub pull request by fixing each comment with its own focused commit, or justifying why no change is needed, then replying to every comment with the resolving commit SHA. Use when the user asks to "address PR comments", "fix Copilot comments on PR <N>", "resolve PR review feedback", or similar.
+description: Address Copilot (or other reviewer) comments on a GitHub pull request by fixing each comment with its own focused commit, or justifying why no change is needed, then replying to every comment with the resolving commit SHA; finishes by tagging any repo issues the PR closes and the relevant milestone (asking the user when unsure). Use when the user asks to "address PR comments", "fix Copilot comments on PR <N>", "resolve PR review feedback", or similar.
 ---
 
 # PR review response
@@ -161,11 +161,60 @@ been responded to, and leaving threads "unresolved" creates noise on the
 PR overview. If you couldn't address a comment (blocked, needs user
 input), leave that thread unresolved and call it out in the summary.
 
-### 6. Report back
+### 6. Link closed issues and milestones
+
+Only after every comment has been addressed and its thread resolved, sweep
+the repo's open issues and milestones and connect the PR to the ones it
+actually completes.
+
+**Issues.** List the open issues:
+
+```bash
+gh issue list --state open --json number,title,body,milestone --limit 100
+```
+
+If there are none, skip ahead. Otherwise, compare each issue against what
+the PR actually changes (`gh pr view <N> --json title,body,files`). For
+each issue the PR **specifically closes** — the PR's changes fully resolve
+what the issue asks for, not merely touch the same area — tag it by adding
+a closing keyword to the PR body so GitHub auto-closes it on merge:
+
+```bash
+# Append to the existing body; never overwrite what the author wrote.
+gh pr edit <N> --body "$(gh pr view <N> --json body --jq .body)
+
+Closes #<issue-number>"
+```
+
+Use one `Closes #<n>` line per issue. Skip issues the PR body already
+references with a closing keyword (`close[sd]`, `fix(es|ed)`,
+`resolve[sd]`).
+
+**Milestones.** List the open milestones:
+
+```bash
+gh api repos/<owner>/<repo>/milestones --jq '.[] | {number, title, description}'
+```
+
+If the PR's work clearly belongs to exactly one milestone (or the issues
+it closes are already assigned to one), tag the PR with it:
+
+```bash
+gh pr edit <N> --milestone "<milestone-title>"
+```
+
+**When unsure, ask.** If you cannot tell whether the PR fully closes an
+issue (partial fix, overlapping scope, ambiguous issue wording) or which
+milestone applies, don't guess — present the candidate issues/milestones
+to the user with a one-line reason each and let them pick which to tag.
+Only tag what the user confirms.
+
+### 7. Report back
 
 When done, summarize: which comments were fixed (with SHAs), which were
-justified, and whether anything needed user input. Don't restate the full
-commit bodies — the user can read them in `git log`.
+justified, whether anything needed user input, and which issues/milestones
+were tagged (or that none applied). Don't restate the full commit bodies —
+the user can read them in `git log`.
 
 ## Conventions
 
@@ -187,6 +236,11 @@ commit bodies — the user can read them in `git log`.
 - Every addressed thread must be resolved at the end via the GraphQL
   `resolveReviewThread` mutation. Posting the reply is not enough; the PR
   overview still shows unresolved threads until the mutation runs.
+- Issue/milestone tagging comes last, and only tags what the PR
+  *specifically* closes. "Related to" is not "closed by" — when in doubt,
+  ask the user rather than auto-closing someone's issue on merge.
+- When editing the PR body to add `Closes #<n>` lines, append — never
+  replace the author's description.
 
 ## Edge cases
 
