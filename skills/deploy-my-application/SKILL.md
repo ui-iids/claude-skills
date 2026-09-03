@@ -1,6 +1,6 @@
 ---
 name: deploy-my-application
-description: Deploy a University of Idaho RCDS/IIDS application to our Kubernetes cluster by generating ArgoCD + Kustomize deploy manifests in the `ui-iids/kubernetes-apps` GitOps repo, modeled on the canonical `apps/rcds/apps/deploy-template/` example. Handles two cases — (1) deploy an EXISTING repo from the `ui-iids` or `ui-insight` GitHub orgs, or (2) scaffold and deploy a NEW project (pick a namespace, generate the full manifest tree). Also seals the app's dev env secrets into a Bitnami SealedSecret with `kubeseal`, piping `.env.secrets` through without ever reading it, and gitignores the plaintext in the app repo. Does its kubernetes-apps work on a dated `deploy/agent-deploy-*` branch and opens a PR against `main` labeled `coding-agent` + `deploy-application` for the user to review and merge. Use when the user says "deploy my application", "deploy this repo", "deploy my app to the cluster", "set up deploy manifests", "create a namespace and deploy", "add my project to kubernetes-apps", "seal my secrets", "kubeseal my env file", "set up sealed secret scripts", "check my kubeconfig", "create the preview label", "validate my deployment", or invokes /deploy-my-application.
+description: Deploy a University of Idaho RCDS/IIDS application to our Kubernetes cluster by generating ArgoCD + Kustomize deploy manifests in the `ui-iids/kubernetes-apps` GitOps repo, modeled on the canonical `apps/rcds/apps/deploy-template/` example. Handles two cases — (1) deploy an EXISTING repo from the `ui-iids` or `ui-insight` GitHub orgs, or (2) scaffold and deploy a NEW project (pick a namespace, generate the full manifest tree). Also seals the app's dev env secrets into a Bitnami SealedSecret with `kubeseal`, piping `.env.secrets` through without ever reading it, and gitignores the plaintext in the app repo. Reaches the cluster read-only through either a local kubeconfig or a service account over SSH to a master node, and builds locally with Docker or Podman (defaulting to Podman). Does its kubernetes-apps work on a dated `deploy/agent-deploy-*` branch and opens a PR against `main` labeled `coding-agent` + `deploy-application` for the user to review and merge. Use when the user says "deploy my application", "deploy this repo", "deploy my app to the cluster", "set up deploy manifests", "create a namespace and deploy", "add my project to kubernetes-apps", "seal my secrets", "kubeseal my env file", "set up sealed secret scripts", "check my kubeconfig", "create the preview label", "validate my deployment", or invokes /deploy-my-application.
 ---
 
 # Deploy my application
@@ -71,10 +71,20 @@ CI from `ui-iids/deploy-template` first.
 ## Step 0 — Establish cluster access
 
 Do this **before** any other fact-finding. Several later steps (Step 6b's dev
-verification above all) need read-only cluster access, and the one thing you
-must never do is guess which kubeconfig points at our dev cluster.
+verification above all) need read-only cluster access, and the one thing you must
+never do is guess how the user reaches our cluster.
 
-**Discover what's on the machine** — read-only, merging nothing, writing nothing:
+There are **two access points**, and which one a person has is not something you
+can infer:
+
+- **Mode 1 — a local kubeconfig** on their machine.
+- **Mode 2 — a service account they SSH into a master node with**, running
+  `kubectl` there. Some users have only this, and some are required to use it
+  even when a local config exists.
+
+### Discover local kubeconfigs
+
+Read-only, merging nothing, writing nothing:
 
 ```bash
 echo "KUBECONFIG=${KUBECONFIG:-<unset>}"
@@ -87,14 +97,28 @@ or client certificate out of one. Context names, cluster names, and server URLs
 are fine to show the user; the credential fields are not — the same rule that
 governs Secret contents in **Guardrails**.
 
-**Then ask, based on what you found:**
+### Ask which access point to use
 
-- **Nothing found** — say so plainly. Every repo-side step still works: manifest
-  generation, sealing (the `--cert` fetch and `--dry-run=client` need no
-  credentials), and all invariant checks. Note that Step 6b will be skipped and
-  hand its checks back to the user.
-- **Exactly one** — *"I found `<path>`, context `<ctx>`, server `<server>`. Can I
-  use this read-only to reach the dev cluster (`k8s-dev.hpc.uidaho.edu`)?"*
+**Always ask.** Finding a kubeconfig does not mean it's the one to use:
+
+> *"How should I reach the dev cluster — one of these local kubeconfigs, or a
+> service account on a master node?"*
+
+- **Kubeconfig(s) found and the user picks one** → Mode 1.
+- **Nothing found** → go to **Mode 2**, don't declare the cluster unreachable.
+  The absence of `~/.kube/config` is not the absence of access; plenty of people
+  here only ever reach the cluster through a service account.
+- **The user names a service account, or says they're required to use one** →
+  Mode 2, even if a local kubeconfig exists.
+- **Neither is available** → then, and only then, proceed repo-only. Every
+  repo-side step still works: manifest generation, sealing (the `--cert` fetch
+  and `--dry-run=client` need no credentials), and all invariant checks. Say that
+  Step 6b will be skipped and hand its checks back to the user.
+
+### Mode 1 — a local kubeconfig
+
+- **Exactly one found** — *"I found `<path>`, context `<ctx>`, server `<server>`.
+  Can I use this read-only to reach the dev cluster (`k8s-dev.hpc.uidaho.edu`)?"*
   Wait for an actual yes.
 - **More than one** — list them and **ask which to use**:
 
@@ -107,22 +131,165 @@ governs Secret contents in **Guardrails**.
   cluster, and our `k8s-dev` may be buried in a file called `config`. Only the
   user knows which is which.
 
-**Once chosen**, pass it explicitly on every command — `kubectl --context <ctx> …`
-— rather than relying on the current context, so nothing you run depends on
-ambient state the user might switch mid-session. Confirm it reaches dev before
-trusting it:
+Pass the context explicitly on every command rather than relying on the current
+context, so nothing depends on ambient state the user might switch mid-session.
+
+### Mode 2 — a service account over SSH
+
+`kubectl` runs **on the master node**, reached as the service account. Ask for
+the two things you must not guess:
+
+1. **The master node** — hostname or IP. Ask every time; never assume one, since
+   it differs per cluster.
+2. **The service account username** to SSH as.
+
+**Never ask for, echo, store, or write a password.** Don't put credentials in a
+command line, a file, or the shell history, and if the user volunteers one, don't
+repeat it back.
+
+**Probe how authentication works** — this decides whether you can act at all:
 
 ```bash
-kubectl --context <ctx> cluster-info
-kubectl --context <ctx> get ns --no-headers | head    # does apps-rcds-* exist?
+ssh -o BatchMode=yes -o ConnectTimeout=10 <sa>@<host> true
 ```
 
-If the server isn't a `k8s-dev.hpc.uidaho.edu` endpoint, stop and re-ask — a
-kubeconfig aimed at production is not a substitute.
+- **Exit 0 → key-based auth.** You can run remote commands yourself:
+  `ssh <sa>@<host> kubectl …`
+- **Non-zero → a password would be prompted.** **Do not attempt an interactive
+  `ssh`** — the prompt blocks with no way for you to answer it and hangs the
+  session. Instead, hand the user the exact command to run themselves (they can
+  prefix it with `!` in this session so the output lands in the conversation) and
+  work from what they paste back. Say plainly that this makes cluster checks a
+  back-and-forth rather than something you can do alone — it changes how the rest
+  of the run feels, and they should hear it once, up front.
+- **Host unreachable / DNS failure** → almost always off the campus network or
+  VPN. Say that and stop; don't retry in a loop.
 
-A **"no" is final for the session.** Proceed repo-only and say explicitly, at
-handoff, which checks went unverified as a result. Cluster access is read-only
-always: see **Guardrails**.
+**Remote execution is narrow, and these are hard rules:**
+
+- The **only** thing you run on the master node is read-only `kubectl`. No file
+  edits, no `scp`, no installs, no looking around — it is shared infrastructure,
+  not a workspace.
+- **Don't pass `--context`** to a remote `kubectl` unless the user names one;
+  contexts are a local-kubeconfig concept and the node has its own.
+- **All repo work stays local.** Manifests are authored and committed on the
+  user's machine; nothing is copied to the node.
+- **Never `cat` a kubeconfig on the master either.** The credential rule applies
+  identically on the remote side.
+
+### Verify the chosen access point works
+
+Do this **before** relying on it for anything. Connecting is not the same as
+having permission:
+
+```bash
+<KUBECTL> cluster-info
+<KUBECTL> get ns --no-headers | head        # does apps-rcds-* exist?
+```
+
+- **Mode 1**: if the server isn't a `k8s-dev.hpc.uidaho.edu` endpoint, stop and
+  re-ask — a kubeconfig aimed at production is not a substitute.
+- **Mode 2**: a `Forbidden` is a permissions finding to **report**, not something
+  to work around. A missing `apps-rcds-*` namespace is itself informative
+  (manifests never merged, or the wrong cluster) — establish which before
+  concluding anything from it.
+
+### Use only what was chosen
+
+Once an access point is settled, **use only it.** If it fails — SSH down,
+`Forbidden`, expired credential — **stop and report**. Do **not** quietly try a
+local kubeconfig because the service account failed, or vice versa.
+
+The reason matters, so it doesn't get "simplified away" later: the two access
+points are **different identities with different RBAC**. A check that fails as
+the service account and passes as the user's personal context has not been
+answered — it has been answered about the wrong person, and a confident "looks
+healthy" from the wrong identity is worse than no answer at all.
+
+A **"no" to cluster access is final for the session.** Proceed repo-only and say
+explicitly, at handoff, which checks went unverified. Cluster access is read-only
+in **both** modes: SSH onto a master node is more power, not more permission —
+see **Guardrails**.
+
+### The resolved command form: `<KUBECTL>`
+
+Everything after this step writes `<KUBECTL>`. Substitute whichever form Step 0
+resolved to:
+
+| Mode | `<KUBECTL>` |
+|------|-------------|
+| Local kubeconfig | `kubectl --context <ctx>` |
+| Service account (key auth) | `ssh <sa>@<host> kubectl` |
+| Service account (password auth) | the same, handed to the user to run |
+
+## Step 0b — Choose the container runtime
+
+Resolve this **before any container command**. Both Docker and Podman are in use
+here, and a hardcoded `docker` simply fails for half the team.
+
+**Detect what's installed:**
+
+```bash
+command -v podman docker
+podman --version 2>/dev/null; docker --version 2>/dev/null
+```
+
+- **Both present** → ask: *"Docker or Podman for local container work?"*
+- **Only one present** → use it and say which. Don't ask a question with one
+  possible answer.
+- **Neither** → local container validation can't run. Say so, skip it, and carry
+  the gap into the handoff rather than letting silence imply it passed.
+
+**Default to Podman** when the user expresses no preference, *or* when nothing
+locally suggests the project already uses Docker — meaning there are no existing
+local containers or images for this app to go by:
+
+```bash
+docker ps -a --format '{{.Image}}' 2>/dev/null | grep -i <app>
+docker images --format '{{.Repository}}' 2>/dev/null | grep -i <app>
+```
+
+Empty results (or `docker` erroring outright) mean there's no local Docker state
+to match, so **Podman is the default**. Say that you defaulted and why, so the
+user can override it in one word.
+
+**Verify the Podman CLI actually works** before committing to it — installed is
+not the same as usable, and this is where people lose time on macOS:
+
+```bash
+podman info >/dev/null 2>&1 || echo "podman not ready (machine likely not running)"
+```
+
+On macOS, Podman runs inside a VM. If `podman info` fails, the fix is
+`podman machine start` (or `podman machine init` on a fresh install). **Give the
+user the command; don't start their VM for them** — it's their machine and their
+resources. If they'd rather not, offer Docker instead of stalling.
+
+**Command mapping.** Later steps write `<RUNTIME>` where either works;
+where a command has no drop-in equivalent, translate with this table:
+
+| Task | Docker | Podman |
+|------|--------|--------|
+| Build | `docker build` | `podman build` |
+| Compose up | `docker compose up -d` | `podman compose up -d` (Podman ≥ 4.4) or `podman-compose up -d` |
+| Status | `docker compose ps` | `podman compose ps` / `podman ps -a` |
+| Logs | `docker compose logs <svc>` | `podman compose logs <svc>` |
+| Tear down | `docker compose down` | `podman compose down` |
+| Inspect a remote image | `docker manifest inspect <ref>` | `skopeo inspect docker://<ref>` |
+
+Two notes that save a wrong turn:
+
+- `podman compose` shells out to `podman-compose` or `docker-compose`. If it
+  reports no provider, try `podman-compose` directly; if neither exists, build
+  and run per service rather than declaring failure.
+- `podman manifest inspect` is **not** the analogue of `docker manifest inspect`
+  — it inspects *local* manifest lists. For "does this tag exist in GHCR?", use
+  `skopeo inspect docker://…`, or `gh api`, which needs no container runtime at
+  all.
+
+**Never switch runtimes mid-run.** Half the stack built in one and half in the
+other produces "it built but there's no container" confusion that costs far more
+than asking. If the chosen runtime breaks, say so and ask before switching.
 
 ## Step 1 — Determine the mode
 
@@ -755,21 +922,29 @@ kubernetes-apps PR is merged and ArgoCD has synced.
 If the stack doesn't run on the user's machine it will not run on the cluster,
 and diagnosing it there costs an order of magnitude more.
 
+Use the runtime resolved in **Step 0b** — `<RUNTIME>` below is `docker` or
+`podman`, and the two are drop-in for everything here. If neither is installed,
+skip this step, say so, and carry the gap into the handoff.
+
 **Build every service the manifests reference.** A service that only ever builds
 in CI is a service you have not validated.
 
 ```bash
 # compose-based (docker-compose.yml / compose.yaml / compose.yml)
-docker compose build && docker compose up -d
+<RUNTIME> compose build && <RUNTIME> compose up -d
 # otherwise, per service
-docker build -f Dockerfile[.<service>] -t <app>[-<service>]:local .
+<RUNTIME> build -f Dockerfile[.<service>] -t <app>[-<service>]:local .
 ```
+
+If `podman compose` reports no provider, fall back to `podman-compose`; if
+neither is available, build and run each service individually rather than
+declaring failure.
 
 **Then prove it functions, not just that it built:**
 
-- Containers reach `running` and **stay** there — `docker compose ps` twice, ~15s
-  apart. A container that is `running` on first look and `Restarting` on second
-  is a crash loop, and it will be `CrashLoopBackOff` on the cluster.
+- Containers reach `running` and **stay** there — `<RUNTIME> compose ps` twice,
+  ~15s apart. A container that is `running` on first look and `Restarting` on
+  second is a crash loop, and it will be `CrashLoopBackOff` on the cluster.
 - Each service answers on its mapped port: `curl -fsS localhost:<port>/<health-or-root>`.
   Use the same path the readiness probe in `deployment.yaml` uses — if they
   disagree, the probe is wrong and you've just found it before the cluster did.
@@ -777,14 +952,17 @@ docker build -f Dockerfile[.<service>] -t <app>[-<service>]:local .
   via `*_ENABLED`, exercise a path that touches them, not just the root route.
 - The repo's own test suite passes, if it has one (`pytest`, `npm test`, …).
 
-**On failure**, read the container logs (`docker compose logs <svc> --tail=100`),
-fix the app-side problem, and re-run — do not proceed to generate or hand off a
-deploy for a stack that doesn't start. If the failure is environmental rather
-than real (a missing local `.env`, a port already bound, no Docker daemon), say
-which it is instead of declaring a pass.
+**On failure**, read the container logs (`<RUNTIME> compose logs <svc>
+--tail=100`), fix the app-side problem, and re-run — do not proceed to generate
+or hand off a deploy for a stack that doesn't start. If the failure is
+environmental rather than real (a missing local `.env`, a port already bound, no
+Docker daemon, a Podman machine that isn't started), say which it is instead of
+declaring a pass.
 
-Tear down when done (`docker compose down`) and report exactly what was built,
-what was exercised, and what passed.
+Tear down when done (`<RUNTIME> compose down`) and report exactly what was built,
+what was exercised, what passed, and **which runtime you used** — a pass on
+Podman and a pass on Docker are not quite the same evidence, and the reader
+should know which one they have.
 
 ### Step 6b — The dev cluster (after the Step 7 PR merges and ArgoCD syncs)
 
@@ -804,7 +982,7 @@ you will have "fixed" it twice.
 **1. Is it synced?**
 
 ```bash
-kubectl --context <ctx> get application -n argocd | grep <app>
+<KUBECTL> get application -n argocd | grep <app>
 ```
 
 Want `Synced` / `Healthy`. `OutOfSync` usually means the PR isn't merged or
@@ -814,7 +992,7 @@ Application itself points at a manifest or AppProject problem, not the workload.
 **2. Pod status — hunt for the hung and unhealthy.**
 
 ```bash
-kubectl --context <ctx> get pods -n apps-rcds-<app>
+<KUBECTL> get pods -n apps-rcds-<app>
 ```
 
 Every pod `Running` **and** `Ready` (`1/1`, not `0/1`) with restarts at 0. Read
@@ -833,8 +1011,8 @@ these states as diagnoses, not noise:
 **3. Troubleshoot what you found.**
 
 ```bash
-kubectl --context <ctx> describe pod <pod> -n apps-rcds-<app>
-kubectl --context <ctx> get events -n apps-rcds-<app> --sort-by=.lastTimestamp | tail -30
+<KUBECTL> describe pod <pod> -n apps-rcds-<app>
+<KUBECTL> get events -n apps-rcds-<app> --sort-by=.lastTimestamp | tail -30
 ```
 
 `describe`'s Events section names the actual cause (`Failed to pull image …`,
@@ -845,8 +1023,8 @@ re-sync.
 **4. Fetch logs where necessary.**
 
 ```bash
-kubectl --context <ctx> logs <pod> -n apps-rcds-<app> --tail=200
-kubectl --context <ctx> logs <pod> -n apps-rcds-<app> --previous --tail=200   # crash loops
+<KUBECTL> logs <pod> -n apps-rcds-<app> --tail=200
+<KUBECTL> logs <pod> -n apps-rcds-<app> --previous --tail=200   # crash loops
 ```
 
 On a crash-looping pod, `--previous` is the one that matters — the current
@@ -1042,15 +1220,23 @@ something you infer from "it looks fine".
   sibling apps disagree, the siblings win. Read at least one working PR-enabled
   app before writing a `pull-request-builds.yaml`.
 
-- **Cluster access: read-only, on the Step 0 context, never for Secret contents.**
-  Cluster reads are a normal part of this skill — Step 6b's validation is built on
-  them, as are one-off facts only the cluster has (the running ArgoCD version:
-  does it support `filters`?, whether `creds-github-<org>` exists, a schema check
-  via `kubectl apply --dry-run=server`, which validates against the real API
-  server and persists nothing). The rules:
-  - **Use the context the user confirmed in Step 0**, passed explicitly as
-    `--context <ctx>` on every command. Never fall back to the ambient current
-    context, and never reach for a kubeconfig the user didn't approve.
+- **Cluster access: read-only, through the Step 0 `<KUBECTL>`, never for Secret
+  contents.** Cluster reads are a normal part of this skill — Step 6b's validation
+  is built on them, as are one-off facts only the cluster has (the running ArgoCD
+  version: does it support `filters`?, whether `creds-github-<org>` exists, a
+  schema check via `kubectl apply --dry-run=server`, which validates against the
+  real API server and persists nothing). The rules:
+  - **Use exactly the access point resolved in Step 0** — `kubectl --context
+    <ctx>` for a local kubeconfig, `ssh <sa>@<host> kubectl` for a service
+    account. Never fall back to the ambient current context, and never reach for
+    a kubeconfig the user didn't approve.
+  - **No cross-mode fallback, ever.** If the chosen access point fails, stop and
+    report — don't try the other one. They are different identities with
+    different RBAC, so an answer from the wrong one isn't a workaround, it's a
+    wrong answer delivered confidently.
+  - **On a master node, read-only `kubectl` and nothing else** — no file edits,
+    no `scp`, no installs, no exploring. SSH access is more power, not more
+    permission, and the node is shared infrastructure.
   - If Step 0 found nothing or the user declined, **don't retry later** — proceed
     repo-only and report the checks you couldn't run.
   - Read-only means read-only: no `apply` (except `--dry-run=server`), `delete`,
