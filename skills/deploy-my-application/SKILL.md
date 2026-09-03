@@ -1,6 +1,6 @@
 ---
 name: deploy-my-application
-description: Deploy a University of Idaho RCDS/IIDS application to our Kubernetes cluster by generating ArgoCD + Kustomize deploy manifests in the `ui-iids/kubernetes-apps` GitOps repo, modeled on the canonical `apps/rcds/apps/deploy-template/` example. Handles two cases — (1) deploy an EXISTING repo from the `ui-iids` or `ui-insight` GitHub orgs, or (2) scaffold and deploy a NEW project (pick a namespace, generate the full manifest tree). Also seals the app's dev env secrets into a Bitnami SealedSecret with `kubeseal`, piping `.env.secrets` through without ever reading it, and gitignores the plaintext in the app repo. Use when the user says "deploy my application", "deploy this repo", "deploy my app to the cluster", "set up deploy manifests", "create a namespace and deploy", "add my project to kubernetes-apps", "seal my secrets", "kubeseal my env file", or invokes /deploy-my-application.
+description: Deploy a University of Idaho RCDS/IIDS application to our Kubernetes cluster by generating ArgoCD + Kustomize deploy manifests in the `ui-iids/kubernetes-apps` GitOps repo, modeled on the canonical `apps/rcds/apps/deploy-template/` example. Handles two cases — (1) deploy an EXISTING repo from the `ui-iids` or `ui-insight` GitHub orgs, or (2) scaffold and deploy a NEW project (pick a namespace, generate the full manifest tree). Also seals the app's dev env secrets into a Bitnami SealedSecret with `kubeseal`, piping `.env.secrets` through without ever reading it, and gitignores the plaintext in the app repo. Does its kubernetes-apps work on a dated `deploy/agent-deploy-*` branch and opens a PR against `main` labeled `coding-agent` + `deploy-application` for the user to review and merge. Use when the user says "deploy my application", "deploy this repo", "deploy my app to the cluster", "set up deploy manifests", "create a namespace and deploy", "add my project to kubernetes-apps", "seal my secrets", "kubeseal my env file", "set up sealed secret scripts", "check my kubeconfig", "create the preview label", "validate my deployment", or invokes /deploy-my-application.
 ---
 
 # Deploy my application
@@ -58,14 +58,71 @@ CI from `ui-iids/deploy-template` first.
   `apps-rcds-<app>`.
 - **Never** write to a cluster — no `apply`, `delete`, `patch`, or `exec`.
   Produce files, then let the user commit/PR them for ArgoCD. Step 5's
-  `--dry-run=client` seal touches no cluster at all. For the narrow read-only
-  cases that are genuinely worth a cluster round-trip, see the cluster-access
-  guardrail — and **announce before the first one**.
+  `--dry-run=client` seal touches no cluster at all. Cluster **reads** are
+  legitimate and expected — that's what Step 0 negotiates and Step 6b spends —
+  but they stay read-only and never touch Secret contents; see the
+  cluster-access guardrail.
 - **Never** put plaintext secrets in manifests, chat, or commit messages. Env
   secrets are Bitnami `SealedSecret`s: you seal the **dev** values yourself
   (Step 5) by piping `.env.secrets` through `kubeseal` without ever reading it.
   Sealed output is encrypted and safe to commit. **Live** secrets stay empty
   until promotion.
+
+## Step 0 — Establish cluster access
+
+Do this **before** any other fact-finding. Several later steps (Step 6b's dev
+verification above all) need read-only cluster access, and the one thing you
+must never do is guess which kubeconfig points at our dev cluster.
+
+**Discover what's on the machine** — read-only, merging nothing, writing nothing:
+
+```bash
+echo "KUBECONFIG=${KUBECONFIG:-<unset>}"
+ls -1 ~/.kube/config ~/.kube/*.yaml ~/.kube/*.conf ~/.kube/configs/* 2>/dev/null
+kubectl config get-contexts        # context + cluster + server, never credentials
+```
+
+**Never `cat` a kubeconfig**, and never echo, copy, or log a token, client key,
+or client certificate out of one. Context names, cluster names, and server URLs
+are fine to show the user; the credential fields are not — the same rule that
+governs Secret contents in **Guardrails**.
+
+**Then ask, based on what you found:**
+
+- **Nothing found** — say so plainly. Every repo-side step still works: manifest
+  generation, sealing (the `--cert` fetch and `--dry-run=client` need no
+  credentials), and all invariant checks. Note that Step 6b will be skipped and
+  hand its checks back to the user.
+- **Exactly one** — *"I found `<path>`, context `<ctx>`, server `<server>`. Can I
+  use this read-only to reach the dev cluster (`k8s-dev.hpc.uidaho.edu`)?"*
+  Wait for an actual yes.
+- **More than one** — list them and **ask which to use**:
+
+  | Path | Context | Cluster server |
+  |------|---------|----------------|
+  | `~/.kube/config` | `k8s-dev` | `https://…k8s-dev.hpc.uidaho.edu` |
+  | `~/.kube/prod.yaml` | `k8s-prod` | `https://…` |
+
+  **Do not pick by name.** A context called `dev` may be a personal kind/minikube
+  cluster, and our `k8s-dev` may be buried in a file called `config`. Only the
+  user knows which is which.
+
+**Once chosen**, pass it explicitly on every command — `kubectl --context <ctx> …`
+— rather than relying on the current context, so nothing you run depends on
+ambient state the user might switch mid-session. Confirm it reaches dev before
+trusting it:
+
+```bash
+kubectl --context <ctx> cluster-info
+kubectl --context <ctx> get ns --no-headers | head    # does apps-rcds-* exist?
+```
+
+If the server isn't a `k8s-dev.hpc.uidaho.edu` endpoint, stop and re-ask — a
+kubeconfig aimed at production is not a substitute.
+
+A **"no" is final for the session.** Proceed repo-only and say explicitly, at
+handoff, which checks went unverified as a result. Cluster access is read-only
+always: see **Guardrails**.
 
 ## Step 1 — Determine the mode
 
@@ -97,8 +154,14 @@ SonarQube code-quality scanning is **opt-in**. Ask the project owner once,
 early: *"Do you want SonarQube set up for this project?"* If they decline, skip
 both Sonar files entirely and move on (deployment doesn't depend on it).
 
-If they say yes, **do not wait** on the manual SonarQube/GitHub setup — it
-happens in two web UIs and would block the deploy for no reason. Instead:
+If they say yes, give them **both links up front** — they will need each one:
+
+- **How-to (start here):**
+  <https://knowledgebase.k8s-dev.hpc.uidaho.edu/index.php/Adding_Sonarqube_to_a_repository>
+- **Our SonarQube instance:** <https://sonarqube.k8s-dev.hpc.uidaho.edu/>
+
+Then **do not wait** on the manual setup — it happens in two web UIs you cannot
+drive, and blocking the deploy on it buys nothing. Instead:
 
 1. **Scaffold immediately.** Copy `.github/workflows/sonar-main.yaml` +
    `sonar-project.properties` from `ui-iids/deploy-template` into the app repo,
@@ -108,17 +171,49 @@ happens in two web UIs and would block the deploy for no reason. Instead:
    layout, and the build/test steps in `sonar-main.yaml` to its stack.
 2. **Keep going** with the rest of the deploy (manifests, etc.). The Sonar scan
    simply won't pass until the owner finishes the steps below — that's harmless.
-3. **Hand the owner this checklist** at the end (only they can do these — you
-   can't create the project or set GitHub secrets for them):
-   - Create the project on our instance
-     <https://sonarqube.k8s-dev.hpc.uidaho.edu/projects>, per
-     <https://knowledgebase.k8s-dev.hpc.uidaho.edu/index.php/Adding_Sonarqube_to_a_repository>.
-   - In the app repo's GitHub settings, add a repo **secret** `SONAR_TOKEN` (the
-     analysis token) and a repo **variable** `SONAR_HOST_URL` =
-     `https://sonarqube.k8s-dev.hpc.uidaho.edu`.
-   - Paste the generated project key (UUID-suffixed, e.g.
-     `ui-iids_my-app_c4489195-...`) into `sonar.projectKey` — or hand it to you
-     and you'll set it.
+3. **Hand the owner these steps.** Only they can do them — you can't create the
+   project or set GitHub secrets for them. Give the whole sequence, not a
+   summary; the first-time flow is where people get stuck:
+
+   1. Sign in at <https://sonarqube.k8s-dev.hpc.uidaho.edu/> with campus SSO.
+      No account? That's a request to RCDS, not something the UI self-serves.
+   2. **Projects → Create project → Manually.** Use the repo name for both the
+      display name and the project key (e.g. `my-app`). SonarQube appends a
+      UUID, so the key you get back is *not* what you typed — it looks like
+      `ui-iids_my-app_c4489195-…`. Copy it exactly.
+   3. Set the **new code definition** when prompted — *Previous version* is the
+      right default for our repos.
+   4. Choose **With GitHub Actions** as the analysis method. The page shows the
+      exact secret/variable names and a sample workflow; our scaffolded
+      `sonar-main.yaml` already matches it, so you only need the values.
+   5. **Generate a token** when offered (*Account → Security → Generate token*
+      if you skipped past it). Scope it to the project, and copy it now — the
+      value is shown **once** and is unrecoverable afterward.
+   6. In the app repo on GitHub: **Settings → Secrets and variables → Actions**.
+      - **Secrets** tab → *New repository secret* → name `SONAR_TOKEN`, value =
+        the token from step 5.
+      - **Variables** tab → *New repository variable* → name `SONAR_HOST_URL`,
+        value `https://sonarqube.k8s-dev.hpc.uidaho.edu` (no trailing slash).
+
+        `SONAR_HOST_URL` is a **variable**, not a secret — putting it in the
+        wrong tab leaves the workflow reading an empty `vars.SONAR_HOST_URL`
+        and defaulting to sonarcloud.io, which fails with a confusing auth
+        error.
+   7. Paste the project key from step 2 into `sonar.projectKey` in
+      `sonar-project.properties` — or hand it to you and you'll set it.
+   8. Push to `main` (or re-run the workflow) and confirm the analysis lands on
+      the project dashboard.
+
+**The two failures you'll be asked about:**
+
+- **Wrong or placeholder `sonar.projectKey`** → the workflow fails with a
+  "project not found" / "could not find a default branch" style error. It is
+  almost always the missing UUID suffix: the key SonarQube generated is not the
+  name you typed.
+- **Coverage reports at 0%** → not an error, and the scan stays green. It means
+  `sonar.<lang>.coverage.reportPaths` points somewhere the test step didn't
+  write. Confirm the workflow actually runs the tests *before* the scan step and
+  that the report path matches (e.g. `coverage.xml`, `lcov.info`).
 
 ## Step 1c — Ask about PR preview builds
 
@@ -156,28 +251,100 @@ app in the repo today — **the template ships no branch filter at all.** So don
 go reading the filter field off the template (it isn't there); if you want branch
 scoping you are *adding* a block, not editing one.
 
-**Ask the owner:**
+**Ask the owner three things, in this order:**
 
-1. *"Do you want PR preview builds — a temporary deploy spun up per open pull
-   request labeled `preview`?"*
-2. Only if yes: *"Which PRs should get one?"* **Do not offer `main` as a
-   presumed default.** Check the app repo's actual branching model first
-   (`gh repo view <org>/<app> --json defaultBranchRef -q .defaultBranchRef.name`,
-   and skim recent PR targets) — plenty of our repos merge features into a
-   long-lived `test` branch and use `test → main` only as a promotion PR. On such
-   a repo, "previews for PRs into `main`" yields previews for exactly the
-   promotion PR, which may or may not be what they meant. Restate their answer as
-   an explicit arrow (`feature/* → test`, or `test → main`) and get confirmation
-   before generating — "PRs into X" and "PRs from X" are opposite ends of the
-   arrow and users mix them up.
+**1. Do they want previews at all?** *"Do you want PR preview builds — a
+temporary deploy spun up per open pull request labeled `preview`?"* Say the cost
+out loud when they answer: each preview is a **full stack** — every service,
+every backing service, every PVC — duplicated per open PR until it closes.
 
-**If they decline**, omit `overlays/dev/pull-request-builds.yaml` and its entry in
-`overlays/dev/kustomization.yaml`. Nothing else changes. Mention in the Step 6
-handoff that previews were skipped and can be added later.
+**2. Which PRs get one?** **Do not offer `main` as a presumed default.** Look at
+the repo's actual branching model *before* asking, so the question is concrete:
+
+```bash
+gh repo view <org>/<app> --json defaultBranchRef -q .defaultBranchRef.name
+gh api repos/<org>/<app>/branches --jq '.[].name'      # is there a long-lived test?
+gh pr list --repo <org>/<app> --state all --limit 20 \
+   --json number,headRefName,baseRefName                # where do PRs actually go?
+```
+
+Then present the two shapes that exist in our fleet:
+
+- **A long-lived `test` branch exists** → features merge `feature/* → test`, and
+  `test → main` is the promotion PR. Previewing **PRs into `test`** is almost
+  always what people mean: it previews the day-to-day work. Previewing **PRs into
+  `main`** on such a repo yields previews for exactly one PR — the promotion —
+  which is a legitimate but very different choice (a last look at the release
+  candidate). Ask which they want; don't assume the common one.
+- **No `test` branch** → every feature PR targets `main`, so `* → main` is the
+  only option and *every* PR gets a full stack. Restate the cost here — this is
+  the configuration that surprises people on a busy repo.
+
+Restate their answer as an explicit arrow (`feature/* → test`, or `test → main`)
+and get confirmation before generating — "PRs into X" and "PRs from X" are
+opposite ends of the arrow and users mix them up constantly.
+
+**3. Do they want a walkthrough?** *"Want a short walkthrough of how to use
+preview builds?"* If yes, see **Teach the workflow** below.
+
+**If they decline previews**, omit `overlays/dev/pull-request-builds.yaml` and its
+entry in `overlays/dev/kustomization.yaml`. Nothing else changes. Don't create the
+label. Mention in the Step 8 handoff that previews were skipped and can be added
+later with `/fix-my-deployment`.
 
 **If they accept**, generate `pull-request-builds.yaml` from the template with the
 generator pointed at `<org>/<app>`, the `preview` label gate kept, and the PR host
-pattern `<app>-pr-{{.number}}.k8s-dev.hpc.uidaho.edu`.
+pattern `<app>-pr-{{.number}}.k8s-dev.hpc.uidaho.edu` — **and create the label now**.
+
+### Create the `preview` label (only when previews are accepted)
+
+The gate is a label, so a repo without that label has previews that are wired
+correctly and do nothing — and a missing label is indistinguishable from
+"previews are broken": the generator matches zero PRs and reports no error
+anywhere. Don't defer this to the handoff; a written-down instruction is a label
+that never gets created.
+
+This writes to the user's GitHub repo, so **ask before running it**:
+
+```bash
+gh label list --repo <org>/<app> --search preview          # check first
+gh label create preview --repo <org>/<app> \
+  --description "Spin up a PR preview environment" --color 0E8A16
+```
+
+- **Already exists** → say so and move on; never `--force` an existing label
+  (someone may be using it for something else — if its description suggests a
+  different purpose, raise that instead of overwriting).
+- **`gh` not installed or not authenticated**, or the user lacks write access →
+  don't improvise. Hand them the `gh label create` line above, or the equivalent
+  UI path (*Issues → Labels → New label*), and note it in the Step 8 handoff as
+  an outstanding blocker rather than a footnote.
+
+### Teach the workflow (only if they asked for a walkthrough)
+
+Put this in the Step 8 handoff, and offer to drop it in the app repo as
+`PREVIEW-BUILDS.md` so it outlives the conversation:
+
+1. **Open the PR** against the branch previews are scoped to — state the arrow
+   you configured (`feature/* → test`), because a PR against the *other* branch
+   gets nothing and looks broken.
+2. **Add the `preview` label** — `gh pr edit <N> --add-label preview`, or the
+   sidebar in the GitHub UI.
+3. **Wait for CI.** The build workflows must push an image tagged
+   `pr-<N>-<8-char-sha>` before anything can start. Watch it with
+   `gh pr checks <N> --repo <org>/<app>`.
+4. **ArgoCD picks it up** within a couple of minutes of the image existing, and
+   creates a namespace `apps-rcds-<app>-pr-<N>` with the whole stack in it.
+5. **Visit** `https://<app>-pr-<N>.k8s-dev.hpc.uidaho.edu`.
+6. **Tear down** by removing the label or closing/merging the PR. The namespace
+   and everything in it is pruned automatically — nothing to clean up by hand.
+
+Tell them what "nothing happened" looks like, in the order worth checking:
+is the label actually on the PR? did the build workflow run and go green for
+*this* PR (not just for `main`)? does the `pr-<N>-<sha>` tag exist in GHCR? is
+the PR's target branch the one previews are scoped to? Only after all four does
+it become a manifest problem — at which point `/fix-my-deployment` has the full
+preview invariant checklist.
 
 **Branch scoping (only if they asked for it).** Add a `filters:` list as a sibling
 of `github:` under `pullRequest:`. The two field names are easy to swap and mean
@@ -254,6 +421,50 @@ include":
   `deploy/overlays/dev/secrets/{env.yaml,kustomization.yaml}` and the `envFrom`
   block in `deployment.yaml`, even with no secrets today — an app with an empty
   `encryptedData: {}` is valid, and adding the wiring back later is fiddly.
+
+## Step 3b — Create the working branch in kubernetes-apps
+
+**Do this before writing a single file into kubernetes-apps.** Everything from
+Step 4 onward — the manifest tree, and the sealed `env.yaml` in Step 5d — lands
+in this repo, and it all belongs on a dedicated branch that you will open a PR
+from in Step 7.
+
+**Branch name:** `deploy/agent-deploy-<login>-<MM>-<DD>-<YYYY>`
+
+Resolve the two tokens rather than guessing:
+
+```bash
+gh api user --jq .login     # GitHub login, e.g. Jarred6068 — lowercase it
+date +%m-%d-%Y              # zero-padded, e.g. 09-03-2026
+```
+
+If `gh` is unauthenticated or unavailable, fall back to `git config user.name`
+lowercased with spaces replaced by hyphens (the convention this repo's other
+skills use), and **say which source you used**. A branch named off the wrong
+identity is confusing but harmless; silently guessing is not.
+
+Then, in the kubernetes-apps checkout:
+
+```bash
+git -C <kubernetes-apps> fetch origin
+git -C <kubernetes-apps> switch -c deploy/agent-deploy-<login>-<MM>-<DD>-<YYYY> origin/main
+```
+
+- **Branch from an up-to-date `origin/main`**, not from whatever the local
+  checkout happens to be sitting on. A stale base produces a PR full of diff
+  that isn't yours, and reviewers will bounce it.
+- **Never commit to `main`.** If the repo is already on a non-`main` branch with
+  uncommitted work in it, **stop and ask** — that's likely someone else's
+  in-progress change, and branching on top of it drags their work into your PR.
+- **If the branch already exists** (a second run the same day), don't force
+  anything. Ask whether to continue on it — usually right, since it's the same
+  user, same day, often the same app — or to start a fresh one with a `-2`
+  suffix.
+- **Only kubernetes-apps gets a branch.** App-repo edits (CI workflows,
+  `Dockerfile`s, `scripts/`, `.gitignore`) stay on whatever branch the user has
+  checked out, and you never commit them — see Step 8.
+
+Nothing is committed here. This step only establishes where the writes land.
 
 ## Step 4 — Generate the manifest tree
 
@@ -381,29 +592,136 @@ The app's env vars reach the pod via `envFrom: secretRef: name: env` in
 kustomization wiring is inherited from the template copy — **there is nothing to
 rewire**, only to verify (Step 4).
 
-**Prerequisite:** the app repo has a `.env.secrets` holding the dev values, one
-`KEY=value` per line, no `export`, no surrounding quotes. If it's missing, ask
-the owner for it — never invent values, and never reconstruct it from a
-`.env.example`.
+This step runs in four parts, **in this order**: gitignore gate → scaffold the
+scripts → the owner fills in the values → seal and verify. The order is not
+cosmetic. From Step 5b onward there is plaintext on disk in the app repo, so the
+ignore rules must already be in place before anything creates a file.
+
+### Step 5a — Gate: verify the gitignore covers the plaintext
+
+**Do this before creating any file and before any seal attempt.** Two plaintext
+artifacts live in the app repo during this workflow:
+
+- `.env.secrets` (or `scripts/.env.secrets`) — the real dev values.
+- `secrets.yaml` (or `scripts/secrets.yaml`) — the **unencrypted** intermediate
+  that `create-credential-secrets.sh` writes between its two commands. If the
+  `kubeseal` line fails, the file left sitting there is plaintext.
+
+Verify rather than assume — the repo may already cover these with a broader rule,
+and blindly appending duplicates is noise. `check-ignore -v` prints the rule that
+matches each path and stays silent for paths nothing covers:
+
+```bash
+git -C <app-repo> check-ignore -v \
+  .env.secrets secrets.yaml scripts/.env.secrets scripts/secrets.yaml
+```
+
+For every path that comes back **uncovered**, append it to the app repo's
+`.gitignore`:
+
+```
+.env.secrets
+secrets.yaml
+scripts/.env.secrets
+scripts/secrets.yaml
+```
+
+Then **re-run `check-ignore` and confirm all four are now covered.** If any path
+is still unignored, **stop**: don't create `scripts/.env.secrets`, don't seal, and
+tell the user why. The app template's `.gitignore` ships as unrelated boilerplate
+and covers none of these, so on a fresh repo assume you are adding all four.
+
+**Also check nothing is already committed** — `.gitignore` does not protect a
+file that is already tracked:
+
+```bash
+git -C <app-repo> ls-files -- .env.secrets secrets.yaml scripts/
+```
+
+If a plaintext secrets file turns up in the index, **say so loudly and stop**:
+those values are in the repo's history, must be treated as leaked, and need
+rotating. Do not quietly `git rm --cached` it — that hides the problem without
+fixing it, and the decision (rotate now? rewrite history?) is the owner's.
+
+Do **not** add any of these to kubernetes-apps' `.gitignore`. The sealed
+`env.yaml` there is encrypted and **must** be committed — ArgoCD can't apply what
+isn't in the repo.
+
+### Step 5b — Scaffold the sealing scripts (app repo)
+
+Once the gate passes, create two files in the **app repo** so the sealing
+workflow is reproducible by the owner without you:
+
+`scripts/.env.secrets` — created **empty**, with a comment header only:
+
+```
+# Dev environment secrets for <app>, one KEY=value per line.
+# No `export`, no surrounding quotes, no blank-line-separated sections.
+# Gitignored — never commit this file.
+```
+
+You write this placeholder and then **never read it again**. Never populate it,
+never copy values from a `.env.example`, never invent values.
+
+`scripts/create-credential-secrets.sh` (make it executable, `chmod +x`):
+
+```bash
+#!/bin/bash
+kubectl create secret generic env --dry-run=client -o yaml --from-env-file=.env.secrets > secrets.yaml
+
+kubeseal --cert https://sealed-secrets.k8s-dev.hpc.uidaho.edu/v1/cert.pem -f secrets.yaml -w secrets.yaml --scope=cluster-wide
+```
+
+Document alongside it, in the handoff:
+
+- It is run **from inside `scripts/`** (`cd scripts && ./create-credential-secrets.sh`)
+  — both paths in it are relative to the script's own directory.
+- It seals `secrets.yaml` **in place**: the file is plaintext after the first
+  command and a SealedSecret after the second. Between them, plaintext is on
+  disk — which is why Step 5a runs first.
+- The sealed result must then be copied to
+  `apps/rcds/apps/<app>/deploy/overlays/dev/secrets/env.yaml` in kubernetes-apps.
+- Neither command needs cluster credentials: `--dry-run=client` never contacts
+  the cluster, and `--cert` fetches the public sealing cert over HTTPS.
+- **Check `kind:` on `scripts/secrets.yaml` before committing anything**, and
+  delete the file when done.
+
+### Step 5c — The owner fills in the values
+
+**Stop here and tell the user**: they must put the dev values into
+`scripts/.env.secrets` — one `KEY=value` per line, no `export`, no surrounding
+quotes — **before** anything is sealed. Never invent values, and never
+reconstruct them from a `.env.example`.
+
+Say what happens if they don't: sealing an empty file produces a perfectly valid
+`SealedSecret` with **zero keys**. Nothing errors, ArgoCD syncs green, and the
+pods boot blind against missing env vars — a failure that looks like an
+application bug and costs an hour to trace back here.
+
+### Step 5d — Seal and verify
 
 **Never read, `cat`, `head`, `grep`, echo, or log `.env.secrets`, and never paste
 any value from it into chat, a file, or a commit message.** You do not need to
-see it to seal it. The command below is the only correct way to handle it:
-plaintext is streamed straight into `kubeseal` and never touches disk.
+see it to seal it.
 
-Run from the app repo root (where `.env.secrets` lives):
+**Where the file lives:** look in **`scripts/.env.secrets` first, then the repo
+root**. New deploys get `scripts/`; plenty of already-deployed apps keep it at
+the root and moving it is not this skill's job.
+
+**Which command you run.** `create-credential-secrets.sh` is the owner-facing
+shared artifact; *you* seal with the pipe below, which streams plaintext straight
+into `kubeseal` and never puts it on disk at all:
 
 ```bash
-kubectl create secret generic env --dry-run=client -o yaml \
-    --from-env-file=.env.secrets \
+cd <app-repo>/scripts && kubectl create secret generic env \
+    --dry-run=client -o yaml --from-env-file=.env.secrets \
   | kubeseal \
       --cert https://sealed-secrets.k8s-dev.hpc.uidaho.edu/v1/cert.pem \
       -o yaml --scope=cluster-wide \
   > <kubernetes-apps>/apps/rcds/apps/<app>/deploy/overlays/dev/secrets/env.yaml
 ```
 
-`--dry-run=client` means no cluster contact; `--cert` fetches the public sealing
-cert over HTTPS. Neither needs cluster credentials.
+(Drop the `scripts/` if the file is at the repo root.)
 
 **Verify before trusting the output.** A failed cert fetch or a broken pipe can
 leave a file that is empty, truncated, or the wrong kind — and the shell
@@ -419,38 +737,246 @@ redirect creates the file either way, so its existence proves nothing. Check:
 
 If `kubeseal` isn't installed or the cert host is unreachable (it's behind the
 campus network), don't improvise a fallback — leave `env.yaml` empty and hand the
-sealing step back to the owner with the command above.
+sealing step back to the owner, who can run `scripts/create-credential-secrets.sh`
+themselves once they're on the network.
 
 Live is **not** sealed here: `deploy/overlays/live/secrets/env.yaml` stays empty
 and is sealed at promotion against the live cert.
 
-### Step 5b — Gitignore the plaintext (app repo only)
+## Step 6 — Validate
 
-In the **app repo** — not kubernetes-apps — ensure `.gitignore` contains:
+Generating manifests is not deploying, and a green ArgoCD sync is not a working
+app. **Do not report success until both halves of this step pass.** They happen
+at different times: 6a runs now, before handoff; 6b can only run after the
+kubernetes-apps PR is merged and ArgoCD has synced.
 
+### Step 6a — The local container stack (always, before handoff)
+
+If the stack doesn't run on the user's machine it will not run on the cluster,
+and diagnosing it there costs an order of magnitude more.
+
+**Build every service the manifests reference.** A service that only ever builds
+in CI is a service you have not validated.
+
+```bash
+# compose-based (docker-compose.yml / compose.yaml / compose.yml)
+docker compose build && docker compose up -d
+# otherwise, per service
+docker build -f Dockerfile[.<service>] -t <app>[-<service>]:local .
 ```
-.env.secrets
-secrets.yaml
+
+**Then prove it functions, not just that it built:**
+
+- Containers reach `running` and **stay** there — `docker compose ps` twice, ~15s
+  apart. A container that is `running` on first look and `Restarting` on second
+  is a crash loop, and it will be `CrashLoopBackOff` on the cluster.
+- Each service answers on its mapped port: `curl -fsS localhost:<port>/<health-or-root>`.
+  Use the same path the readiness probe in `deployment.yaml` uses — if they
+  disagree, the probe is wrong and you've just found it before the cluster did.
+- Backing services actually connect: if the app has Postgres/Redis/Mongo wired
+  via `*_ENABLED`, exercise a path that touches them, not just the root route.
+- The repo's own test suite passes, if it has one (`pytest`, `npm test`, …).
+
+**On failure**, read the container logs (`docker compose logs <svc> --tail=100`),
+fix the app-side problem, and re-run — do not proceed to generate or hand off a
+deploy for a stack that doesn't start. If the failure is environmental rather
+than real (a missing local `.env`, a port already bound, no Docker daemon), say
+which it is instead of declaring a pass.
+
+Tear down when done (`docker compose down`) and report exactly what was built,
+what was exercised, and what passed.
+
+### Step 6b — The dev cluster (after the Step 7 PR merges and ArgoCD syncs)
+
+This is the one step that outlives the handoff: the namespace doesn't exist until
+a human merges the PR you open in Step 7. Run it when they tell you they've
+merged, or offer to on a later invocation — don't sit and poll for it.
+
+Needs the context confirmed in **Step 0**. If access was declined or unavailable,
+**skip this and say so explicitly** in the handoff, listing the checks that went
+unverified — silence here reads as "verified".
+
+Everything below is **read-only**. No `apply`, `delete`, `patch`, `exec`, or
+`rollout restart`: when you find a problem you fix the *manifest* and let ArgoCD
+converge. Patching the cluster produces drift ArgoCD will silently revert, and
+you will have "fixed" it twice.
+
+**1. Is it synced?**
+
+```bash
+kubectl --context <ctx> get application -n argocd | grep <app>
 ```
 
-`.env.secrets` is the real plaintext. `secrets.yaml` is the intermediate the
-older two-step seal wrote to disk; the piped command never creates it, but ignore
-it anyway so a hand-run of the old flow can't commit plaintext. Note the app
-template's `.gitignore` ships as unrelated boilerplate and ignores neither, so
-assume you must add them.
+Want `Synced` / `Healthy`. `OutOfSync` usually means the PR isn't merged or
+ArgoCD hasn't polled yet — **wait, don't intervene**. `Unknown`/`Degraded` on the
+Application itself points at a manifest or AppProject problem, not the workload.
 
-Do **not** add these to kubernetes-apps' `.gitignore`. The sealed `env.yaml`
-there is encrypted and **must** be committed — ArgoCD can't apply what isn't in
-the repo.
+**2. Pod status — hunt for the hung and unhealthy.**
 
-## Step 6 — Hand off
+```bash
+kubectl --context <ctx> get pods -n apps-rcds-<app>
+```
 
+Every pod `Running` **and** `Ready` (`1/1`, not `0/1`) with restarts at 0. Read
+these states as diagnoses, not noise:
+
+| State | What it almost always means |
+|-------|-----------------------------|
+| `ImagePullBackOff` / `ErrImagePull` | image string ≠ what CI builds, or CI never pushed (check 1 & 2 of the invariants) |
+| `CreateContainerConfigError` | the `env` Secret doesn't exist — the SealedSecret never decrypted; check it was sealed `--scope=cluster-wide` |
+| `Pending` | PVC unbound, or no node can schedule it (resources / node selector) |
+| `CrashLoopBackOff` | app-level failure — go straight to logs, with `--previous` |
+| `Running` but `0/1` | readiness probe failing: wrong port, wrong path, or the app is slower to start than the probe allows |
+| `Init:*` stuck | an init container or a backing service it waits on isn't up |
+| `Terminating` for minutes | stuck finalizer or a pod that ignores SIGTERM — note it, don't force-delete |
+
+**3. Troubleshoot what you found.**
+
+```bash
+kubectl --context <ctx> describe pod <pod> -n apps-rcds-<app>
+kubectl --context <ctx> get events -n apps-rcds-<app> --sort-by=.lastTimestamp | tail -30
+```
+
+`describe`'s Events section names the actual cause (`Failed to pull image …`,
+`MountVolume.SetUp failed`, `secret "env" not found`). Map each finding back to
+the invariant it violates, fix the manifest in kubernetes-apps, and let ArgoCD
+re-sync.
+
+**4. Fetch logs where necessary.**
+
+```bash
+kubectl --context <ctx> logs <pod> -n apps-rcds-<app> --tail=200
+kubectl --context <ctx> logs <pod> -n apps-rcds-<app> --previous --tail=200   # crash loops
+```
+
+On a crash-looping pod, `--previous` is the one that matters — the current
+container's logs are from the *next* doomed attempt, often empty. For multi-
+container pods add `-c <container>`. **Never paste anything credential-shaped out
+of logs** into chat, a file, or a commit; if a log line contains a secret,
+summarize it ("the DB password is being read as empty") and say where to look.
+
+**5. Test the dev site functionally.**
+
+```bash
+curl -fsSI https://<app>.k8s-dev.hpc.uidaho.edu
+```
+
+Confirm TLS is valid, the status is what the app should return, and you are not
+looking at the ingress default backend (a 404 with no app headers means Ingress
+routing or the Service name is wrong while the pods are perfectly healthy —
+invariant 3). Then run real functionality:
+
+- If the repo's test suite can target a base URL, run it against dev
+  (`BASE_URL=https://<app>.k8s-dev.hpc.uidaho.edu <test command>`) and report
+  pass/fail counts.
+- Otherwise exercise the documented endpoints or main user path by hand, and
+  **say that the coverage was manual** rather than implying a suite ran.
+- Exercise at least one path that touches each backing service and any persistent
+  storage — those are exactly the pieces that work locally and fail on the
+  cluster.
+
+**6. Report a pass/fail line per check** (sync, pods, logs clean, dev site,
+functional tests). If anything failed, the deploy is not done: say what broke,
+what you changed, and what still needs a re-sync. Green sync is not evidence the
+app works — never let it stand in for this step.
+
+## Step 7 — Commit, push, and open the PR
+
+Run this once Step 6a passes. You commit and PR the **kubernetes-apps** work
+yourself, on the Step 3b branch — that is the one place this skill writes to
+GitHub on its own. You never merge it.
+
+### Step 7a — The pre-commit gate
+
+You are about to commit automatically, so the "check `kind:` before a file
+moves" rule stops being advice and becomes a **stop condition**. A push is the
+point of no return: after it, anything wrong is in the remote's history.
+
+```bash
+git -C <kubernetes-apps> status --short
+git -C <kubernetes-apps> diff --cached --name-only
+head -3 <kubernetes-apps>/apps/rcds/apps/<app>/deploy/overlays/dev/secrets/env.yaml
+```
+
+Three things must hold before you commit:
+
+1. **`secrets/env.yaml` says `kind: SealedSecret`.** If it says `Secret`,
+   **do not commit** — delete the file, tell the user plaintext nearly escaped,
+   and stop. This is the single most important check in the skill.
+2. **Every staged path is under `apps/rcds/apps/<app>/`** (plus a
+   `deploy-repo-secrets-<project>-live/` dir if promoting). Anything else —
+   a sibling app, the template, a stray editor file — **unstage it and say why**.
+   An automated commit is exactly where an accidental edit slips through.
+3. **No `.env.secrets` or plaintext `secrets.yaml` is staged.** Those live in the
+   app repo and have no business in kubernetes-apps at all; if one appears here,
+   something went badly wrong upstream — stop and investigate.
+
+Stage explicitly by path — `git add apps/rcds/apps/<app>/` — **never `git add -A`
+or `git add .`**, which is how unrelated working-tree state ends up in a PR.
+
+### Step 7b — Commit and push
+
+One commit, or a few logical ones. The message names the app and what was
+generated, and carries whatever attribution footer this session is configured to
+use. **Never put a secret value in a commit message**, including "helpful"
+context like which key changed to what.
+
+```bash
+git -C <kubernetes-apps> commit -m "Add deploy manifests for <app>"
+git -C <kubernetes-apps> push -u origin deploy/agent-deploy-<login>-<MM>-<DD>-<YYYY>
+```
+
+### Step 7c — Open the labeled PR
+
+```bash
+gh pr create --repo ui-iids/kubernetes-apps \
+  --base main --head deploy/agent-deploy-<login>-<MM>-<DD>-<YYYY> \
+  --title "Deploy <app> to k8s-dev" \
+  --label coding-agent --label deploy-application \
+  --body-file <body-file>
+```
+
+Base is **`main`** — ArgoCD syncs from it on merge.
+
+**PR body** — what a reviewer needs, and nothing they must not see:
+
+- what the app is, and whether this was Mode A (existing repo) or Mode B (new),
+- the files added and the key substitutions: image string(s), ports, dev host,
+  backing services, storage,
+- the seal result: sealed, verified, and the **key count** — **never a value,
+  and never a key-to-value mapping**,
+- Step 6a local validation results: what built, what was exercised, what passed,
+- preview scope as an explicit arrow (`feature/* → test`), if previews were
+  included,
+- outstanding blockers: CI hasn't pushed an image yet, `scripts/.env.secrets`
+  not yet filled in, `preview` label not created, live secrets unsealed,
+- the attribution footer this session is configured to use.
+
+**If labeling fails** — a label doesn't exist, or the user lacks permission — the
+PR is still open and that is fine. Report it and hand over the fix:
+`gh pr edit <N> --add-label coding-agent --add-label deploy-application`.
+**Do not** close and recreate the PR to retry labels.
+
+**Never merge it.** No `gh pr merge`, no `--admin`, no auto-merge, no push to
+`main`. The merge is the human review gate this entire flow exists to preserve —
+if the user asks you to merge, that's their call to make explicitly, not
+something you infer from "it looks fine".
+
+## Step 8 — Hand off
+
+- **Lead with the action they owe you**, as its own line — not a footnote:
+
+  > **Action required: review and merge the PR in `ui-iids/kubernetes-apps`** —
+  > `<PR URL>`. Nothing is deployed until you merge it; ArgoCD syncs on merge.
+
+  Then say what is blocked behind that merge: the Step 6b dev-cluster
+  validation, preview environments becoming active at all, and the app-repo
+  commit/PR they still owe (which you did **not** open for them).
 - Summarize the files created and the key substitutions.
 - Report the seal result: that dev `env.yaml` is sealed and verified, and how
   many keys it carries — **never which values**.
-- Tell the user the remaining manual step you should not do:
-  1. **Commit + open a PR** to `ui-iids/kubernetes-apps`; ArgoCD deploys on
-     merge. The sealed `env.yaml` is encrypted and belongs in that commit.
+- Report the Step 6 validation results: what the local stack did, and either the
+  dev-cluster findings or an explicit "not verified on the cluster, because …".
 - Flag for later: `deploy/overlays/live/secrets/env.yaml` is still empty and
   needs its own seal against the live cert when the app is promoted.
 - **If previews were included**, spell out how one is actually triggered — the
@@ -460,16 +986,23 @@ the repo.
      `apps/rcds/apps/*` sourcing each app's `overlays/dev`, so a new
      `pull-request-builds.yaml` there is picked up on its own.
   2. The PR must be **labeled `preview`** — `gh pr edit <N> --add-label preview`.
-     The label frequently doesn't exist in a fresh repo yet, and a missing label
-     is indistinguishable from "previews are broken": the generator just matches
-     nothing, with no error anywhere. Tell them to create it if needed
-     (`gh label create preview`).
+     Confirm the label was created in Step 1c; if it wasn't (no `gh` auth, no
+     write access), list that as an **open blocker**, not a footnote — a missing
+     label is indistinguishable from "previews are broken", since the generator
+     matches nothing with no error anywhere.
   3. State the scope you configured as an arrow (`test → main`), the URL they'll
      get (`https://<app>-pr-<N>.k8s-dev.hpc.uidaho.edu`), and that it's pruned on
-     PR close.
-- Do not commit or push unless the user explicitly asks. Note that the app repo
-  CI (workflows + Dockerfiles, plus the `.gitignore` from Step 5b) and the
-  kubernetes-apps manifests are **separate repos** — each needs its own commit/PR.
+     PR close. Include the walkthrough from Step 1c if they asked for one.
+- **If secrets are still unsealed** because the owner hasn't filled in
+  `scripts/.env.secrets` (Step 5c), say so as a blocker and point them at
+  `scripts/create-credential-secrets.sh` plus where to copy the sealed output.
+- **The two repos are handled differently, and say so plainly.** kubernetes-apps
+  is committed, pushed, and PR'd by you (Step 7). The **app repo** — CI
+  workflows + Dockerfiles, the `scripts/` sealing files, and the `.gitignore`
+  from Step 5a — is left uncommitted in their working tree and needs its own
+  commit and PR **from them**. Don't commit or push in the app repo, and don't
+  let "the PR is open" imply both repos are handled: they're separate repos and
+  the app-repo half is still theirs to land.
 - If the app repo's `build-*-container.yaml` hasn't run yet (no image in GHCR),
   call that out as a blocker — ArgoCD will fail to pull until CI builds it.
 
@@ -478,8 +1011,14 @@ the repo.
 - Two write locations only: (1) in kubernetes-apps, `apps/rcds/apps/<app>/` (plus,
   for a new live project, a `deploy-repo-secrets-<project>-live/` dir at the repo
   root if needed); (2) in the app repo, its `.github/workflows/`,
-  `Dockerfile[.<service>]`, and `.gitignore` when scaffolding/fixing CI or
-  Step 5b. Don't edit other apps or either template.
+  `Dockerfile[.<service>]`, `scripts/` (the Step 5b sealing files), and
+  `.gitignore` (Step 5a). Don't edit other apps or either template.
+- **Three sanctioned GitHub-side writes, and no others:** the `preview` label in
+  Step 1c (only after the user asks for previews and okays it), the
+  kubernetes-apps branch in Step 3b, and the labeled PR in Step 7. Still
+  forbidden: **merging** any PR, pushing to `main`, changing repo settings,
+  branching or committing in the **app repo**, and any write at all to a repo
+  outside `ui-iids`/`ui-insight`.
 - Plaintext secrets are write-only to you: stream `.env.secrets` into `kubeseal`,
   never read it back, never echo a value, never let a `kind: Secret` file reach
   the manifest repo. If you're ever unsure whether a file is sealed, check
@@ -503,14 +1042,20 @@ the repo.
   sibling apps disagree, the siblings win. Read at least one working PR-enabled
   app before writing a `pull-request-builds.yaml`.
 
-- **Cluster access: read-only, announced, never for Secret contents.** Occasionally
-  a fact only the cluster has is worth it — the running ArgoCD version (does it
-  support `filters`?), whether `creds-github-<org>` exists, or a schema check via
-  `kubectl apply --dry-run=server` (validates against the real API server and
-  persists nothing). These are legitimate, but:
-  - **Say you're about to touch the cluster before you do it.** The user is
-    thinking about files in a repo; unannounced `kubectl` against their live
-    context is a surprise, and `--dry-run=server` still contacts the cluster.
+- **Cluster access: read-only, on the Step 0 context, never for Secret contents.**
+  Cluster reads are a normal part of this skill — Step 6b's validation is built on
+  them, as are one-off facts only the cluster has (the running ArgoCD version:
+  does it support `filters`?, whether `creds-github-<org>` exists, a schema check
+  via `kubectl apply --dry-run=server`, which validates against the real API
+  server and persists nothing). The rules:
+  - **Use the context the user confirmed in Step 0**, passed explicitly as
+    `--context <ctx>` on every command. Never fall back to the ambient current
+    context, and never reach for a kubeconfig the user didn't approve.
+  - If Step 0 found nothing or the user declined, **don't retry later** — proceed
+    repo-only and report the checks you couldn't run.
+  - Read-only means read-only: no `apply` (except `--dry-run=server`), `delete`,
+    `patch`, `scale`, or `rollout restart`. Fix manifests, not clusters — ArgoCD
+    reverts drift, so a live patch "works" exactly until the next sync.
   - Prefer existence checks that cannot leak: `kubectl get secret <name>
     --ignore-not-found`. **Never** read a Secret's `data`/`stringData` — and don't
     reach for `-o jsonpath` on a Secret even for a benign field; on Secrets the
