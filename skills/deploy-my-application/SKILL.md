@@ -556,13 +556,89 @@ reference):
 | `apps-rcds-<app>` | derived — ArgoCD project + namespace |
 | image(s) | **exactly** what the app repo's `build-*-container.yaml` builds: `ghcr.io/<org>/<app>:main` (single) or `ghcr.io/<org>/<app>-<service>:main` per service (multi) |
 | services | one Deployment+Service per built image (e.g. backend, frontend) |
-| container port | each service's listen port (e.g. 8000) |
+| container port | each service's listen port (e.g. 8000) — **confirmed by Step 2b** when the smoke build runs; an inferred port is the most common cause of a green sync with a dead Ingress |
 | dev host | `<app>.k8s-dev.hpc.uidaho.edu` |
 | live host + TLS | only if promoting to prod (real domain) |
 | backing services | none / mongodb / redis / postgres / mariadb |
 | persistent storage | does the app need its own PVC? |
 | PR previews? | **ask** (Step 1c) — include the ApplicationSet or not |
 | PR scope | PR previews only — the confirmed source→target arrow (Step 1c). Label-gated by default; add `filters:` only if they asked for branch scoping. Never assume `main`. |
+
+## Step 2b — Smoke-build the stack locally (optional)
+
+The values you just collected — container port above all — are about to be
+written into several files. A short local build confirms them from the running
+thing instead of from a Dockerfile that may be out of date.
+
+**Ask:**
+
+> *"Want me to build and start the stack locally first? It takes a few minutes,
+> and it confirms the ports and health-check paths I'm about to write into the
+> manifests instead of me inferring them."*
+
+State the trade plainly: a few minutes now, against a wrong port baked into a
+Deployment, a Service, and an Ingress and not discovered until Step 6a. Use the
+runtime resolved in **Step 0b**.
+
+**Default the recommendation to what the repo actually supports:**
+
+- **A compose file or `Dockerfile` exists** → recommend yes.
+- **Mode B (new project) with nothing built yet** → skip it; there is no stack to
+  build. Say so rather than asking a question with no possible answer.
+- **No container runtime at all** (Step 0b found neither) → skip, and say that
+  Step 6a will be skipped for the same reason, so **nothing** in this run gets
+  local verification. That's worth hearing once, early.
+
+**What it is — a smoke build, deliberately not the full pass:**
+
+```bash
+<RUNTIME> compose build && <RUNTIME> compose up -d     # or per-service build
+<RUNTIME> compose ps
+curl -fsS localhost:<port>/                            # and any documented health path
+```
+
+**What to harvest, and feed back into Step 2's table:**
+
+| Token | What the running stack tells you |
+|-------|----------------------------------|
+| container port | the port actually bound and answering — not just what `EXPOSE` claims |
+| health path | the path that returns 200, which becomes the readiness probe |
+| services | one container per image the manifests will reference |
+| backing services | which of Postgres / Redis / Mongo the app genuinely needs to boot |
+
+**When observation and assumption disagree, the observation wins** — and say so
+out loud. It usually means the Dockerfile drifted or the user is remembering an
+older version, and that is worth them knowing regardless of the deploy.
+
+**Tear down when done** (`<RUNTIME> compose down`). A stack left running holds
+the ports Step 6a needs.
+
+**This is a smoke build, not the validation.** It answers "does it build, and
+what does it expose?" It does **not** replace Step 6a's crash-loop check, its
+backing-service exercise, or its test-suite run. A green Step 2b never stands in
+for Step 6a — if nothing has changed since, Step 6a's *build* may come back fast
+off the layer cache, but every functional check still runs.
+
+### Declining and failing are not the same thing
+
+- **The user declines** → proceed. Author the manifests from the repo instead
+  (`EXPOSE`, compose `ports:`, the app's own config), and **record that the
+  values were not locally verified** — it goes in the Step 7 PR body and the
+  Step 8 handoff, so a reviewer knows the port is inferred rather than observed.
+- **No runtime available** → same: proceed, values inferred, flagged.
+- **The build fails** → this is a finding, not a formality. Report it and fix the
+  app-side problem **before generating manifests**: a stack that can't build
+  won't deploy, and the manifests would otherwise encode guesses about something
+  that doesn't run. A failed build is **not** waved through to Step 7.
+
+|  | Manifests | PR (Step 7) |
+|---|---|---|
+| Declined | proceed, values inferred | allowed, flagged as unverified |
+| No runtime | proceed, values inferred | allowed, flagged |
+| **Build failed** | **stop, fix the app first** | **blocked until Step 6a passes** |
+
+The principle, since these get conflated: **not looking is a choice the user is
+allowed to make; looking and seeing it broken is not something to route around.**
 
 ## Step 3 — Decide what to include
 
@@ -926,6 +1002,12 @@ Use the runtime resolved in **Step 0b** — `<RUNTIME>` below is `docker` or
 `podman`, and the two are drop-in for everything here. If neither is installed,
 skip this step, say so, and carry the gap into the handoff.
 
+**If Step 2b already ran and passed** and nothing has changed since, don't
+re-narrate the build — the layer cache will make it fast and there's nothing new
+to report about it. Every *functional* check below still runs: Step 2b proved the
+stack builds and answers on a port, not that it works. **This step is the gate
+before the PR, and a failure here blocks Step 7 whatever Step 2b said.**
+
 **Build every service the manifests reference.** A service that only ever builds
 in CI is a service you have not validated.
 
@@ -1088,6 +1170,10 @@ Three things must hold before you commit:
 3. **No `.env.secrets` or plaintext `secrets.yaml` is staged.** Those live in the
    app repo and have no business in kubernetes-apps at all; if one appears here,
    something went badly wrong upstream — stop and investigate.
+4. **Local validation didn't fail.** A *skipped* build — declined, or no runtime
+   — is fine: proceed and flag it in the PR body. A build that **ran and failed**
+   is not: fix the app first. Don't open a PR proposing to deploy something you
+   watched fail to start.
 
 Stage explicitly by path — `git add apps/rcds/apps/<app>/` — **never `git add -A`
 or `git add .`**, which is how unrelated working-tree state ends up in a PR.
@@ -1123,7 +1209,10 @@ Base is **`main`** — ArgoCD syncs from it on merge.
   backing services, storage,
 - the seal result: sealed, verified, and the **key count** — **never a value,
   and never a key-to-value mapping**,
-- Step 6a local validation results: what built, what was exercised, what passed,
+- local validation: what built, what was exercised, what passed — and if the
+  stack was **not** verified locally (Step 2b declined, or no container runtime),
+  say so plainly, so the reviewer knows the ports and probe paths are inferred
+  rather than observed,
 - preview scope as an explicit arrow (`feature/* → test`), if previews were
   included,
 - outstanding blockers: CI hasn't pushed an image yet, `scripts/.env.secrets`
@@ -1153,8 +1242,10 @@ something you infer from "it looks fine".
 - Summarize the files created and the key substitutions.
 - Report the seal result: that dev `env.yaml` is sealed and verified, and how
   many keys it carries — **never which values**.
-- Report the Step 6 validation results: what the local stack did, and either the
-  dev-cluster findings or an explicit "not verified on the cluster, because …".
+- Report the validation results: what the local stack did — including "not
+  verified locally, because …" when Step 2b and Step 6a were both skipped — and
+  either the dev-cluster findings or an explicit "not verified on the cluster,
+  because …".
 - Flag for later: `deploy/overlays/live/secrets/env.yaml` is still empty and
   needs its own seal against the live cert when the app is promoted.
 - **If previews were included**, spell out how one is actually triggered — the

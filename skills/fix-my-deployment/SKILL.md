@@ -445,6 +445,12 @@ updates:
 - kubernetes-apps: a Deployment+Service per new image, an ImageUpdater entry,
   Ingress routing if externally reachable, and every new file listed in its
   `kustomization.yaml`. Re-verify checks 1–4 for the new service.
+- **Offer a local smoke build of the new service first** — this recipe writes a
+  fresh container port and probe path, which is exactly what a two-minute
+  `<RUNTIME> build` + `curl` confirms instead of infers. Use the runtime from
+  Step 0b. Declining is fine: proceed with the values from the Dockerfile and
+  note in the PR that they weren't verified locally. A build that **fails** is a
+  finding — fix it before writing the Deployment.
 - Flag that the new service's CI must run once before ArgoCD can pull.
 
 **Add / change env vars (re-seal).** The sealed `env.yaml` is replaced
