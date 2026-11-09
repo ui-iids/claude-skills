@@ -23,6 +23,12 @@ understand at a glance — not a transcript of every command you ran.
   tasks, changing statuses, or logging time, show the user exactly what you
   will write (task names, subtasks, statuses, time entries) and wait for an
   explicit yes. Edits the user asks for get re-previewed.
+- **Always use the RCDS workspace: `workspace_id="9017952524"`.** Pass it
+  on every ClickUp call that accepts a `workspace_id` (hierarchy reads,
+  searches, task creation, time entries). Never let a tool default to another
+  workspace, and never act on a task, space, or list that isn't in this
+  workspace. If a task ID the user gives resolves to a different workspace,
+  stop and ask.
 - **Never delete or overwrite existing ClickUp data.** Don't delete tasks,
   subtasks, comments, or time entries. Don't rename or re-describe an existing
   task unless the user asks. If something existing looks wrong, flag it.
@@ -47,7 +53,10 @@ understand at a glance — not a transcript of every command you ran.
    `clickup_add_time_entry`). If they are listed as deferred, load the ones
    you'll need with ToolSearch in a single call.
 2. Make one cheap read call to prove the connection actually works — e.g.
-   `clickup_get_workspace_hierarchy` — and note the workspace name.
+   `clickup_get_workspace_hierarchy` with `workspace_id="9017952524"` — and
+   note the workspace name. If that workspace isn't accessible to the
+   connected account, stop and tell the user; don't fall back to another
+   workspace.
 3. **If no ClickUp tools exist, or the call fails with an auth/connection
    error, stop.** Tell the user the connector isn't configured and how to add
    it:
