@@ -1,6 +1,6 @@
 ---
 name: fix-my-deployment
-description: Diagnose and repair or update an EXISTING University of Idaho RCDS/IIDS deployment in the `ui-iids/kubernetes-apps` GitOps repo — audit its ArgoCD + Kustomize manifests against the canonical `apps/rcds/apps/deploy-template/` example and the app repo's CI, find what is broken or drifted, and fix it. Handles two cases — (1) REPAIR a broken deploy (ImagePullBackOff, pods pending, sync green but nothing running, previews never appearing), or (2) UPDATE a working deploy (new services, new env vars re-sealed with `kubeseal`, backing services, storage, adding PR previews or SonarQube, promoting to live). Reaches the cluster read-only through either a local kubeconfig or a service account over SSH to a master node, and uses Docker or Podman locally (defaulting to Podman). Does its kubernetes-apps work on a dated `fix/agent-fix-*` branch and opens a PR against `main` labeled `coding-agent` + `fix-deploy` for the user to review and merge. Use when the user says "fix my deployment", "my deployment is broken", "my pods won't start", "ArgoCD won't sync", "update my deployment", "add a service to my deployment", "add env vars to my deployment", "re-seal my secrets", "my preview builds aren't working", "check my kubeconfig", "why won't my pods start", or invokes /fix-my-deployment.
+description: Diagnose and repair or update an EXISTING University of Idaho RCDS/IIDS deployment in the `ui-iids/kubernetes-apps` GitOps repo — audit its ArgoCD + Kustomize manifests against the canonical `apps/rcds/apps/deploy-template/` example and the app repo's CI, find what is broken or drifted, and fix it. Handles two cases — (1) REPAIR a broken deploy (ImagePullBackOff, pods pending, sync green but nothing running, previews never appearing), or (2) UPDATE a working deploy (new services, new env vars re-sealed with `kubeseal`, backing services, storage, adding PR previews or SonarQube, promoting to live). Reaches the cluster read-only through either a local kubeconfig or a service account over SSH to a master node, and uses Docker or Podman locally (defaulting to Podman). Does its kubernetes-apps work on a dated `fix/agent-fix-*` branch and opens a PR against `main` labeled `coding-agent` + `fix-deployment` for the user to review and merge. Use when the user says "fix my deployment", "my deployment is broken", "my pods won't start", "ArgoCD won't sync", "update my deployment", "add a service to my deployment", "add env vars to my deployment", "re-seal my secrets", "my preview builds aren't working", "check my kubeconfig", "why won't my pods start", or invokes /fix-my-deployment.
 ---
 
 # Fix my deployment
@@ -577,9 +577,13 @@ git -C <kubernetes-apps> push -u origin fix/agent-fix-<login>-<MM>-<DD>-<YYYY>
 gh pr create --repo ui-iids/kubernetes-apps \
   --base main --head fix/agent-fix-<login>-<MM>-<DD>-<YYYY> \
   --title "Fix <app> deployment: <short symptom or change>" \
-  --label coding-agent --label fix-deploy \
+  --label coding-agent --label fix-deployment \
   --body-file <body-file>
 ```
+
+The label names must match the repo's existing labels exactly — check them with
+`gh label list --repo ui-iids/kubernetes-apps` first, because a missing label
+makes `gh pr create` fail without opening a PR.
 
 **PR body:** the diagnosis (what was broken, which invariant it violated, and
 why it produced the reported symptom) or the update requested; the files changed;
@@ -587,9 +591,11 @@ the Step 6a verification result; if secrets were re-sealed, that it's sealed and
 verified plus the **key count** — **never a value**; drift you noticed and
 deliberately left alone; and any ordering blocker.
 
-**If labeling fails** (label missing, or no permission), the PR is still open —
-report it and hand over `gh pr edit <N> --add-label coding-agent --add-label
-fix-deploy`. Don't close and recreate the PR to retry labels.
+**If labeling fails, check why.** A missing label means `gh pr create` exited
+without opening a PR — re-run it without that `--label` flag, then report it
+and hand over `gh pr edit <N> --add-label coding-agent --add-label
+fix-deployment` once the label exists. On a permission failure the PR is still
+open — don't close and recreate it to retry labels.
 
 **Never merge it.** No `gh pr merge`, no `--admin`, no auto-merge, no push to
 `main`.
