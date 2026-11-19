@@ -46,6 +46,11 @@ resolve it, the PR is **not ready**. Say so plainly.
   merge into the local `test` branch (fast-forwarding it from `origin/test`
   is fine), and never set `test` as a branch's upstream. Changes reach `test`
   only through the reviewed PR flow.
+- **Never fix SonarQube findings on your own.** A scan reports issues across
+  the whole repo, most of them outside the PR's scope. Read the results,
+  report them, and **ask the user how to proceed** (step 5f) before changing
+  any code because of them. Fixing everything the scan finds would break the
+  module-scope rule in `wwad-code-check`.
 - **Ask before posting PR comments.** Comments on an Azure DevOps PR are
   visible to the whole team. Show the user the full set of comments you plan
   to post, get one confirmation, then post them.
@@ -500,6 +505,58 @@ The server scan is still the source of truth.
 **Pass** when both coverage numbers are at least 80% and no touched function
 exceeds 15.
 
+**5f. Decide what to fix: ask the user (mandatory stop)**
+
+The scan analyses the whole repo, so it reports far more than this PR
+touched (a single Nexus scan found 34 over-complexity functions, 18 bugs,
+and 867 code smells). **Don't edit any code because of the scan until the
+user has chosen a scope.** This is a hard stop, even if Nexus's own
+instructions or an earlier message seemed to approve fixes in general.
+
+1. **Work out the PR's module scope** from `changed-paths.txt`: the deepest
+   module directories the PR touches, for example
+   `backend/app/modules/osp/analytics` or `frontend/src/modules/osp`. If
+   the PR also edits shared code (`backend/app/common/`,
+   `frontend/src/sharedComponents/`, and so on), include those exact files,
+   not their whole directories. If the PR touches more than one module, list
+   each one.
+2. **Fetch all open issues** once
+   (`api/issues/search?componentKeys=$SONAR_PROJECT_KEY&resolved=false&ps=500`,
+   paging with `p=` until done) and bucket them:
+   - **A. In module scope:** the issue's file is inside the module scope from
+     step 1. Split this into "in lines this PR changed" and "elsewhere in the
+     module".
+   - **B. Bugs outside the module:** `type=BUG`, outside scope A.
+   - **C. Everything else outside the module:** code smells, complexity, and
+     security hotspots outside scope A.
+3. **Report** a short summary table: count per bucket by type and severity,
+   plus the top 5 in-scope issues with `path:line` and rule. Make clear that
+   only the gates in 5d and 5e (coverage of changed lines, complexity of
+   touched functions) decide whether the PR is ready. Buckets B and C never
+   block readiness.
+4. **Ask** which scope to fix. Ask with a single numbered question in chat and wait for the answer. Don't proceed on silence, and don't treat an earlier approval as the answer. Offer exactly these options, in
+   this order, with option 3 always last and never recommended:
+   1. **Fix code in `<module>` (Recommended):** fix bucket A only, meaning
+      issues inside the PR's module scope, prioritising lines this PR changed
+      and anything failing the 5d/5e gates.
+   2. **Fix bugs only:** fix bucket A's bugs plus bucket B (`BUG`-type issues
+      anywhere in the repo). No code-smell or complexity refactors.
+   3. **Fix everything (not recommended):** buckets A, B, and C. Warn that
+      this touches modules outside the PR's scope, breaks the module-scope
+      rule in `wwad-code-check`, makes the PR much harder to review, and can
+      collide with other people's open work.
+
+   Substitute the real module path for `<module>` in option 1. If the user
+   picks something else (for example "report only, fix nothing", or a
+   specific list), do exactly that.
+5. **Fix within the chosen scope only.** All other rules still apply:
+   propose each change before making it (Nexus's `CLAUDE.md`), one commit
+   per fix category, no suppressions, and re-run `uv run scripts/check.py`.
+   Commit any fix outside the PR's module separately, with a subject naming
+   the module it touched (for example `Fix S1244 float equality in payroll
+   (out-of-scope, approved)`), so a reviewer can review it on its own or drop
+   it. After fixing, rescan (5b–5e) to confirm the gates.
+
 ### 6. VERSION bump and `sync_versions.py`
 
 1. Read the versions:
@@ -574,7 +631,7 @@ subject) and anything still needing the user:
 | 2 | Migration order | PASS / N/A / FAIL | module, NNNN, head |
 | 3 | `scripts/check.py` | PASS / FIXED / FAIL | … |
 | 4 | Files ≤ 1500 lines | PASS / FLAGGED | files + comment links |
-| 5 | Sonar coverage ≥ 80% / complexity ≤ 15 | PASS / FAIL | BE x%, FE y%, n complex fns |
+| 5 | Sonar coverage ≥ 80% / complexity ≤ 15 | PASS / FAIL | BE x%, FE y%, n complex fns; fix scope chosen: 1 / 2 / 3 / none |
 | 6 | VERSION + sync | PASS / FIXED / FAIL | test=a.b.c → branch=x.y.z |
 
 Close with a one-line verdict: **Ready for review** only if every row is

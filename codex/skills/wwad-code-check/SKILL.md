@@ -185,6 +185,11 @@ modules/<module>/
   `osp/analytics` means you don't edit `osp/preaward` or `payroll`. If a
   change outside the module is truly needed, stop and explain why before
   touching it.
+- **Scan results don't widen scope.** SonarQube, lint, or type-checker
+  output often lists problems in other modules. Don't fix them on your own.
+  Report them and ask the user which scope to fix, using the three options
+  in `$wwad-pr-checklist` step 5f: (1) this module, recommended; (2) bugs only;
+  (3) everything, not recommended.
 - **Shared code goes in `backend/app/common/`** (`common/services`,
   `common/models`, `common/api`, `common/config.py`). Only move something
   there when two or more modules actually use it.
